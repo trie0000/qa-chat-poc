@@ -133,8 +133,18 @@ start.bat をダブルクリック
 
 - **設定は broker 側の `config.json` の `"corp"` セクション**に置く（ブラウザUIには一切持たせない。UIはリストへ質問を出し回答を読むだけ）：
   - `seg_url`（ベクトル化済み文書=セグメントの SPO URL）／`base_url`（社内API ゲートウェイ or リレー loopback）／
-    `deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`
+    `deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`／`proxy_url`（任意）
   - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
+  - リクエストは `base_url + /openai/deployments/<deploy>/embeddings?api-version=…`（Tadori リレーが受ける形式と同一）。
+
+### プロキシ／リレー（Tadori と同じ 2 通り）
+
+| 方式 | `base_url` | `proxy_url` | 社内プロキシの通過 |
+|---|---|---|---|
+| **リレー経由（推奨）** | Tadori リレーの loopback（例 `http://127.0.0.1:18080`） | 空 | **リレー（`tadori-ai-relay.ps1`）が `TADORI_AI_PROXY` で担う**。broker は loopback を叩くだけ |
+| ゲートウェイ直叩き | ゲートウェイの base（例 `https://<resource>.openai.azure.com`） | 社内プロキシURL（システム既定と別のとき） | broker が `Invoke-RestMethod -Proxy` で通過。空ならシステム既定プロキシ |
+
+> リレー経由なら broker 側にプロキシ設定は要らない（Tadori と同じ責務分担）。`api-key` ヘッダはどちらの方式でも broker が付与しリレーが透過する。
 - **broker.ps1** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
   1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
   2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み

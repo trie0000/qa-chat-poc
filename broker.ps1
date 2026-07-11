@@ -288,12 +288,18 @@ function Corp-Settings {
     dimensions        = if ($Corp.dimensions) { [int]$Corp.dimensions } else { $null }
     embed_api_version = if ($Corp.embed_api_version) { [string]$Corp.embed_api_version } else { '2024-02-01' }
     chat_api_version  = if ($Reasoning -contains $chat) { '2024-12-01-preview' } else { '2024-06-01' }
+    # Optional explicit proxy for DIRECT-to-gateway calls. Leave empty when base_url
+    # is tadori's loopback relay (127.0.0.1:PORT) -- the relay handles the on-prem
+    # proxy (TADORI_AI_PROXY) itself, and loopback bypasses the system proxy anyway.
+    proxy             = [string]$Corp.proxy_url
   }
 }
 function Corp-Http($url, $bodyObj) {
   $json = $bodyObj | ConvertTo-Json -Depth 20 -Compress
-  return Invoke-RestMethod $url -Method Post -Headers @{ 'api-key' = $script:CS.api_key } `
-         -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 300
+  $p = @{ Uri = $url; Method = 'Post'; Headers = @{ 'api-key' = $script:CS.api_key }
+          ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes($json); TimeoutSec = 300 }
+  if ($script:CS.proxy) { $p.Proxy = $script:CS.proxy; $p.ProxyUseDefaultCredentials = $true }
+  return Invoke-RestMethod @p
 }
 function Corp-Embed($text) {
   $s = $script:CS
