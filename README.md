@@ -137,14 +137,18 @@ start.bat をダブルクリック
   - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
   - リクエストは `base_url + /openai/deployments/<deploy>/embeddings?api-version=…`（Tadori リレーが受ける形式と同一）。
 
-### プロキシ／リレー（Tadori と同じ 2 通り）
+### プロキシ（リレーは不要）
+
+**broker は PowerShell（サーバサイド）なので、ゲートウェイを直接叩く**。Tadori がリレーを立てるのは
+API 呼び出し元が**ブラウザ**で、社内プロキシ・CORS・Private Network Access を越えられないためであって、
+broker にはどれも当てはまらない（＝リレーの1ホップは不要）。
 
 | 方式 | `base_url` | `proxy_url` | 社内プロキシの通過 |
 |---|---|---|---|
-| **リレー経由（推奨）** | Tadori リレーの loopback（例 `http://127.0.0.1:18080`） | 空 | **リレー（`tadori-ai-relay.ps1`）が `TADORI_AI_PROXY` で担う**。broker は loopback を叩くだけ |
-| ゲートウェイ直叩き | ゲートウェイの base（例 `https://<resource>.openai.azure.com`） | 社内プロキシURL（システム既定と別のとき） | broker が `Invoke-RestMethod -Proxy` で通過。空ならシステム既定プロキシ |
+| **ゲートウェイ直叩き（既定）** | ゲートウェイの base（例 `https://<resource>.openai.azure.com`） | 社内プロキシURL。システム既定プロキシで足りるなら空 | broker が `Invoke-RestMethod -Proxy`（NTLM等は `-ProxyUseDefaultCredentials`）で通過 |
+| （任意）既存の Tadori リレー流用 | リレーの loopback（例 `http://127.0.0.1:18080`） | 空 | リレーが `TADORI_AI_PROXY` で担う。**すでにリレーを常駐させている場合のみ**の選択肢 |
 
-> リレー経由なら broker 側にプロキシ設定は要らない（Tadori と同じ責務分担）。`api-key` ヘッダはどちらの方式でも broker が付与しリレーが透過する。
+> `api-key` ヘッダは broker が付与。社内CAの自己署名証明書でTLS検証に失敗する環境だけ別途対応が要る（現状未実装。必要なら追加する）。
 - **broker.ps1** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
   1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
   2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み
