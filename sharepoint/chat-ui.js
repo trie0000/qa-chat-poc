@@ -1,7 +1,7 @@
 /* =============================================================================
  * chat-ui.js  --  QA chat overlay (browser side)
  * -----------------------------------------------------------------------------
- * Deployed to an SPO document library; fetched + injected by broker.py via CDP.
+ * Deployed to an SPO document library; fetched + injected by broker.ps1 via CDP.
  * Runs inside the authenticated SharePoint page, talks to SPO REST with the
  * browser's own session (credentials: 'include'). No secrets here.
  *

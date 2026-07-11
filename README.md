@@ -6,11 +6,11 @@ SharePoint Online (SPO) リストを**メッセージキュー**にした QA チ
 ```
 利用者ブラウザ(SSO) ──> SPOリストに質問登録(Pending)
    Power Automate ──> 作成を検知して Status=Detected / DetectedAt を記録
-   broker.py(ローカル) ──> Detected を拾い Ollama で回答生成 ──> Answer/Answered を書き戻し
+   broker.ps1(ローカル) ──> Detected を拾い ローカルOllama/社内API で回答生成 ──> Answer/Answered を書き戻し
 利用者ブラウザ ──> 回答を検知して吹き出し表示 / DisplayedAt を記録
 ```
 
-**設計の肝**: `broker.py` は SPO の認証情報を一切持たない。SPO REST はすべて
+**設計の肝**: `broker.ps1` は SPO の認証情報を一切持たない。SPO REST はすべて
 **ブラウザのセッションに相乗り**して実行する（CDP `Runtime.evaluate` → ページ内 `fetch`）。
 UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読まれる（ローカルに同梱しない）。
 
@@ -21,14 +21,13 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 | ファイル | 役割 |
 |---|---|
 | `start.bat` | `broker.ps1` を起動する薄いラッパー（`chcp 65001`） |
-| **`broker.ps1`** | **本体（PowerShellのみ・Python不要）**：Edge起動・CDP接続(ClientWebSocket)・認証待ち・リスト自動作成・UI注入・監視ループ・Ollama RAG・書き戻し・計測 |
-| `broker.py` | 上記のPython版（社内API検索モード `corp.py` を含む。ローカルモードは `broker.ps1` で十分） |
+| **`broker.ps1`** | **本体（PowerShellのみ・Python不要）**：Edge起動・CDP接続(ClientWebSocket)・認証待ち・リスト自動作成・UI注入・監視ループ・ローカルOllama/社内API RAG・書き戻し・計測 |
 | `config.json` | 設定（`config.example.json` をコピーして作成。gitignore 済） |
 | `sharepoint/chat-ui.js` | SPOライブラリへ手動アップロードするブラウザ側UI |
 | `setup/create-list.ps1` | `QA_PoC` リスト作成（PnP.PowerShell）。無い環境向けに手動手順も |
 | `setup/README-PA-flow.md` | Power Automate フロー作成手順（実装対象外・仕様のみ） |
 | `knowledge/manual.md` | 検証用の仮想マニュアル（RAG の知識ソース） |
-| `build_index.py` | manual.md をチャンク化し Ollama で事前ベクトル化 → `knowledge/index.json` |
+| `build_index.ps1` | manual.md をチャンク化し Ollama で事前ベクトル化 → `knowledge/index.json` |
 | `knowledge/index.json` | 事前計算した埋め込みインデックス（broker が読み込む） |
 | `logs/latency.csv` | 区間別レイテンシの出力先 |
 
@@ -53,8 +52,8 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 > **上表の QA_PoC リスト・列と chat-ui.js の SPO 配置は、broker が初回起動時に自動作成**します。
 > 手動のリスト作成/アップロードは不要です（`setup/create-list.ps1` は参考用に残置）。
 
-> **ローカルOllamaモードは Python 不要**。broker は `broker.ps1`（PowerShell + Windows標準のみ）。
-> Python が要るのは「マニュアルを編集して索引を作り直す（`build_index.py`）」か「社内API検索モード（`broker.py`+`corp.py`）」のときだけ。
+> **Python は一切不要**。broker もインデックス生成もすべて PowerShell（`broker.ps1` / `build_index.ps1`、Windows標準のみ）。
+> ローカルOllama検索・社内API検索の両モードとも `broker.ps1` 1本で動く。
 
 1. **前提**: git / 標準Edge（ローカルAIで動かすなら Ollama）。**インストール不要**（PowerShellは同梱）。
 2. **clone**:
@@ -67,8 +66,8 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
    （`browser_path` は Edge のパス。既定のままで大抵OK）。
 4. **（ローカルAIモードなら）モデル**: `ollama pull qwen2.5:7b` と `ollama pull bge-m3`。
    ※同梱の `knowledge/index.json` をそのまま使うので**索引の再生成は不要**。マニュアル(`knowledge/manual.md`)を
-     変えたときだけ `python build_index.py` で作り直す（Python必要）。
-   ※社内API検索モードで使うなら Ollama/索引は不要（`config.json` の `corp` を埋めて `broker.py` で起動）。
+     変えたときだけ `powershell -NoProfile -File build_index.ps1` で作り直す。
+   ※社内API検索モードで使うなら Ollama/索引は不要（`config.json` の `corp` を埋めて `start.bat` で起動）。
 5. **PAフロー作成**: `setup/README-PA-flow.md`（作成トリガー → `Status=Detected` / `DetectedAt=utcNow()`）。
 6. **起動**: `start.bat`。**初回起動でリスト・列・chat-ui.js を自動生成**し、サインイン後にチャットが立ち上がる。
    ※`running scripts is disabled` が出たら一度だけ: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
@@ -113,18 +112,18 @@ start.bat をダブルクリック
 `knowledge/manual.md`（架空の問い合わせ管理システムのマニュアル）を知識ソースとして、
 **質問に関連する箇所だけを検索して回答**します。
 
-- **事前処理**: `build_index.py` が manual.md を `## ` セクション単位でチャンク化し、
+- **事前処理**: `build_index.ps1` が manual.md を `## ` セクション単位でチャンク化し、
   **Ollama の埋め込みモデル `bge-m3`（多言語・日本語に強い）** でベクトル化 → `knowledge/index.json` に保存。
 - **回答時**: broker が質問を埋め込み → cos 類似で上位 `top_k`(既定4) チャンクを取得 →
   **回答モデル `qwen2.5:7b`** に「資料をよく読んで答える／無ければ『資料に記載がありません』／出典見出しを示す」指示付きで渡す。
 - **効果（実測）**: 「再オープンは何日以内？→クローズ後7日以内（章10）」等、**根拠つきで正答**。
   マニュアルに無い質問（例: 経費精算）は **「資料に記載がありません」** と正しく拒否。
 
-**マニュアルを差し替える／増やすとき**: `knowledge/manual.md` を編集 → `python build_index.py` で索引を作り直す → broker 再起動。
+**マニュアルを差し替える／増やすとき**: `knowledge/manual.md` を編集 → `powershell -NoProfile -File build_index.ps1` で索引を作り直す → broker 再起動。
 埋め込みモデル/回答モデルは `config.json` の `embed_model` / `ollama_model` で変更可（モデルを変えたら索引の再構築が必要）。
 
-> 補足: pptx 等の別形式を知識にしたい場合も、抽出（例: `python-pptx`）でテキスト化し
-> 同じ `build_index.py` の流れ（チャンク→埋め込み→index.json）に載せれば同様に使えます。
+> 補足: pptx 等の別形式を知識にしたい場合も、テキスト抽出して `knowledge/manual.md` に足せば
+> 同じ `build_index.ps1` の流れ（チャンク→埋め込み→index.json）に載せて同様に使えます。
 > 画像内の文字は OCR しない限り取り込めない点に注意。
 
 ## 社内API検索モード（Tadori セグメント / Azure OpenAI 互換）
@@ -136,7 +135,7 @@ start.bat をダブルクリック
   - `seg_url`（ベクトル化済み文書=セグメントの SPO URL）／`base_url`（社内API ゲートウェイ or リレー loopback）／
     `deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`
   - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
-- **broker.py** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
+- **broker.ps1** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
   1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
   2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み
   3. L2 正規化 cosine で Top-K
@@ -146,12 +145,13 @@ start.bat をダブルクリック
 
 > ⚠ **未接続検証**：社内API・api-key・実 Tadori セグメントは開発環境から到達できないため、実接続の E2E はここでは未検証。
 > 実装は Tadori の契約（`src/embeddings/client.ts` 等）に厳密準拠し、**リクエスト形式・float16デコード・cosine・config読込はモックで確認済み**。
-> セグメントのファイル構成（manifest + seg ファイル）は Tadori の想定形式を仮定しているので、実出力が異なる場合は `corp.load_segments()` を調整する。
+> セグメントのファイル構成（manifest + seg ファイル）は Tadori の想定形式を仮定しているので、実出力が異なる場合は `broker.ps1` の `Corp-LoadSegments` を調整する。
 
 ## 技術メモ / 制約
 
-- **Python から SPO へ直接 HTTP しない**（認証を持たないため）。必ず CDP → ブラウザ `fetch` 経由。
-- 依存は最小（`websocket-client`, `requests`）。Playwright 等の重い依存は使わない。
+- **broker から SPO へ直接 HTTP しない**（認証を持たないため）。必ず CDP → ブラウザ `fetch` 経由。
+- 依存ゼロ（Windows標準の PowerShell 5.1 + in-box csc の `Add-Type`）。Python も外部モジュールも Playwright も使わない。
+  CDP は `System.Net.WebSockets.ClientWebSocket`、社内API/Ollama は `Invoke-RestMethod`、float16 は自前デコーダで処理。
 - 対象ブラウザは Edge 既定 / Chrome も `browser_path` で切替可。
 - Windows ネイティブ実行（WSL2ではない）。Ollama は `ollama_endpoint` で別ホストにも向けられる。
 - 秘密情報（APIキー等）は扱わない。`config.json` にも置かない。

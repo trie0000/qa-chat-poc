@@ -1,7 +1,7 @@
 # Power Automate フロー作成手順（QA_PoC）
 
 このPoCでは、**Power Automate (PA) が「アイテム作成を検知した事実」だけを記録**します。
-回答生成はローカルの `broker.py`（Ollama）が担当します。PAは *検知記録係* に徹します。
+回答生成はローカルの `broker.ps1`（Ollama/社内API）が担当します。PAは *検知記録係* に徹します。
 
 本番構成ではこの検知トリガーの先で「カスタムコネクタ→社内OpenAI互換API」を呼びますが、
 検証環境ではそれが使えないため、**PAは Status を `Detected` にし、`DetectedAt` に UTC 時刻を書くだけ**にします。

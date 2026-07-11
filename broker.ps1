@@ -4,9 +4,8 @@
 #   * launches Edge with a debug port, drives it over CDP (ClientWebSocket)
 #   * auto-creates the QA_PoC list + columns, uploads chat-ui.js, injects the UI
 #   * polls Detected items and answers them with local Ollama RAG (manual index)
+#     OR the corporate API (Azure OpenAI compatible) when config.json "corp" is set
 # ASCII-only console output; all Japanese text is read from config.json (UTF-8).
-# Corp-API search mode is Python-only for now (see corp.py); this port covers the
-# local Ollama path.
 # =============================================================================
 $ErrorActionPreference = 'Stop'
 # 'sp' is a built-in alias for Set-ItemProperty and would shadow our SpReqfunction.
@@ -31,6 +30,11 @@ $HistMax    = if ($cfg.history_max_turns) { [int]$cfg.history_max_turns } else {
 $ProfileDir = Join-Path $Here '.edgeprofile'
 $SessionId  = [guid]::NewGuid().ToString()
 $ByList     = "/_api/web/lists/getbytitle('$ListTitle')"
+$Corp       = $cfg.corp                                             # corp-API search config (may be $null / empty)
+$Reasoning  = @('gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini')  # reasoning models -> preview api-version
+$script:Mode = 'local'   # 'local' (Ollama) | 'corp' (corporate API)
+$script:CS = $null       # resolved corp settings
+$script:Segments = @()   # corp pre-vectorized documents
 
 function Log($m) { Write-Host "[broker] $m" }
 function UtcNow { (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
@@ -62,6 +66,29 @@ public class Cdp {
       else if (c == '\r') sb.Append("\\r"); else if (c == '\t') sb.Append("\\t");
       else if (c < 0x20) sb.Append("\\u" + ((int)c).ToString("x4")); else sb.Append(c); }
     sb.Append('"'); return sb.ToString(); } }
+'@
+
+# float16 (LE uint16, base64) -> double[]. PS 5.1 = .NET Framework 4.8 has no
+# System.Half, so decode the IEEE-754 half bits by hand (matches the tadori contract).
+Add-Type -TypeDefinition @'
+using System;
+public static class CorpF16 {
+  static float H2F(ushort h) {
+    uint sign = (uint)(h & 0x8000) << 16; int exp = (h & 0x7c00) >> 10; uint mant = (uint)(h & 0x03ff); uint bits;
+    if (exp == 0) {
+      if (mant == 0) { bits = sign; }
+      else { int e = -1; uint m = mant; while ((m & 0x400) == 0) { e++; m <<= 1; } m &= 0x03ff;
+             bits = sign | ((uint)(e + 127 - 15 + 1) << 23) | (m << 13); }
+    } else if (exp == 0x1f) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((uint)(exp - 15 + 127) << 23) | (mant << 13); }
+    return BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+  }
+  public static double[] Decode(string b64) {
+    byte[] raw = Convert.FromBase64String(b64); int n = raw.Length / 2; double[] o = new double[n];
+    for (int i = 0; i < n; i++) { ushort h = (ushort)(raw[i*2] | (raw[i*2+1] << 8)); o[i] = (double)H2F(h); }
+    return o;
+  }
+}
 '@
 
 $script:Cdp = $null
@@ -243,9 +270,80 @@ function Retrieve($question) {
   return @($scored | Sort-Object score -Descending | Select-Object -First $TopK | ForEach-Object { $_.c })
 }
 
+# ---- corp-API search (Azure OpenAI compatible; tadori segments in SPO) --------
+# Config lives in config.json "corp"; the browser UI holds none of it. Azure
+# deployment name = deploy_prefix + model (dots removed). base_url may be the corp
+# gateway directly or a loopback relay -- .NET DefaultWebProxy bypasses loopback
+# and routes remote hosts through the system proxy, so Invoke-RestMethod "just works".
+function Corp-Enabled { return [bool]($Corp -and $Corp.base_url -and $Corp.api_key -and $Corp.seg_url -and $Corp.embed_model) }
+function Corp-Deploy($model) { if (-not $model) { return '' }; return ($Corp.deploy_prefix + ($model -replace '\.', '')) }
+function Corp-Settings {
+  $chat = [string]$Corp.chat_model
+  [pscustomobject]@{
+    base              = ($Corp.base_url).TrimEnd('/')
+    seg_url           = ($Corp.seg_url).TrimEnd('/')
+    api_key           = [string]$Corp.api_key
+    chat_deploy       = (Corp-Deploy $chat)
+    embed_deploy      = (Corp-Deploy ([string]$Corp.embed_model))
+    dimensions        = if ($Corp.dimensions) { [int]$Corp.dimensions } else { $null }
+    embed_api_version = if ($Corp.embed_api_version) { [string]$Corp.embed_api_version } else { '2024-02-01' }
+    chat_api_version  = if ($Reasoning -contains $chat) { '2024-12-01-preview' } else { '2024-06-01' }
+  }
+}
+function Corp-Http($url, $bodyObj) {
+  $json = $bodyObj | ConvertTo-Json -Depth 20 -Compress
+  return Invoke-RestMethod $url -Method Post -Headers @{ 'api-key' = $script:CS.api_key } `
+         -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 300
+}
+function Corp-Embed($text) {
+  $s = $script:CS
+  $url = "$($s.base)/openai/deployments/$($s.embed_deploy)/embeddings?api-version=$($s.embed_api_version)"
+  $body = @{ input = @($text) }
+  if ($s.dimensions) { $body.dimensions = $s.dimensions }
+  return (Corp-Http $url $body).data[0].embedding
+}
+function Corp-Chat($messages) {
+  $s = $script:CS
+  $url = "$($s.base)/openai/deployments/$($s.chat_deploy)/chat/completions?api-version=$($s.chat_api_version)"
+  return (Corp-Http $url @{ messages = $messages }).choices[0].message.content
+}
+function Sp-FetchJson($absUrl) {   # fetch an ABSOLUTE SPO url via the browser session (cache-busted)
+  $u = $absUrl | ConvertTo-Json
+  $js = "(async()=>{const u=$u;const r=await fetch(encodeURI(u)+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now()," +
+        "{credentials:'include',cache:'no-cache'});if(!r.ok)throw new Error('HTTP '+r.status);return await r.text();})()"
+  return (Eval-Value $js $true) | ConvertFrom-Json
+}
+function Corp-LoadSegments {
+  $s = $script:CS
+  $manifest = Sp-FetchJson "$($s.seg_url)/manifest.json"
+  $files = $manifest.files; if (-not $files) { $files = $manifest.segments }; if (-not $files) { $files = $manifest.seg }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($f in @($files)) {
+    $u = if ([string]$f -like 'http*') { [string]$f } else { "$($s.seg_url)/$f" }
+    $seg = Sp-FetchJson $u
+    $recs = if ($seg -is [array]) { $seg } elseif ($seg.records) { $seg.records } else { @($seg) }
+    foreach ($r in $recs) {
+      $emb = $r.embedding
+      if ($emb -is [string]) { $emb = [CorpF16]::Decode($emb) }
+      if (-not $emb) { continue }
+      $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.from) { $r.from } else { '' }
+      [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb })
+    }
+  }
+  return $out
+}
+function Corp-Search($question) {
+  $q = Corp-Embed $question
+  $scored = foreach ($seg in $script:Segments) {
+    if ($seg.embedding.Count -ne $q.Count) { continue }
+    [pscustomobject]@{ score = (Cosine $q $seg.embedding); c = $seg }
+  }
+  return @($scored | Sort-Object score -Descending | Select-Object -First $TopK | ForEach-Object { $_.c })
+}
+
 # ---- answer a Detected item ----
 function Build-Messages($curTurn, $question) {
-  $chunks = Retrieve $question
+  $chunks = if ($script:Mode -eq 'corp') { Corp-Search $question } else { Retrieve $question }
   if ($chunks.Count) { Log ("retrieved: " + (($chunks | ForEach-Object { $_.section }) -join ', ')) }
   $system = $cfg.system_prompt
   if ($chunks.Count) {
@@ -275,7 +373,7 @@ function Handle-Detected($it) {
   Log "picked item $id (turn $($it.Turn))"
   try {
     $messages = Build-Messages $it.Turn ([string]$it.Question)
-    $answer = Ollama-Chat $messages
+    $answer = if ($script:Mode -eq 'corp') { Corp-Chat $messages } else { Ollama-Chat $messages }
     Sp-Write "$ByList/items($id)" @{ Answer = $answer; Status = 'Answered'; AnsweredAt = (UtcNow) } @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = '*' } | Out-Null
     Log "answered item $id ($($answer.Length) chars)"
   } catch {
@@ -308,8 +406,21 @@ Log 'CDP connected'
 Wait-Auth
 Ensure-Setup
 Inject-UI
-Load-Index
-if ($script:Index) { Log "local Ollama RAG: $($script:Index.chunks.Count) chunks (embed=$EmbedModel, chat=$ChatModel)" } else { Log 'no knowledge index (plain chat)' }
+# Retrieval backend: corp API (if config.json "corp" is filled in) else local Ollama index.
+if (Corp-Enabled) {
+  $script:CS = Corp-Settings
+  try {
+    $script:Segments = Corp-LoadSegments
+    $script:Mode = 'corp'
+    Log "corp search ON: $($script:Segments.Count) segments (base=$($script:CS.base) embed=$($script:CS.embed_deploy) chat=$($script:CS.chat_deploy))"
+  } catch {
+    Log "corp segments load failed ($($_.Exception.Message)) -> falling back to local Ollama"
+  }
+}
+if ($script:Mode -ne 'corp') {
+  Load-Index
+  if ($script:Index) { Log "local Ollama RAG: $($script:Index.chunks.Count) chunks (embed=$EmbedModel, chat=$ChatModel)" } else { Log 'no knowledge index (plain chat)' }
+}
 Log "monitoring list '$ListTitle' for Detected items"
 while ($true) {
   try {

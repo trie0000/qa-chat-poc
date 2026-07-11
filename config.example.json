@@ -14,7 +14,7 @@
   "system_prompt": "あなたは社内システムマニュアルのQAアシスタントです。簡潔に日本語で回答してください。",
   "grounding_prompt": "\n\n以下の【参考資料】をよく読み、質問に答えてください。\n- 参考資料に根拠がある場合は、その内容（数値・条件も含む）を使って具体的に答えてください。\n- 参考資料のどこにも関連する記述が無い場合に限り「資料に記載がありません」と答えてください。\n- 最後に参照した見出しを示してください。\n\n===== 参考資料 =====\n",
   "corp": {
-    "_comment": "社内API検索モード（別プロセスの broker が使う設定。ブラウザUIには置かない）。base_url/api_key/seg_url を埋めると broker.py が社内API検索に切替、空ならローカルOllama。",
+    "_comment": "社内API検索モード（別プロセスの broker が使う設定。ブラウザUIには置かない）。base_url/api_key/seg_url を埋めると broker.ps1 が社内API検索に切替、空ならローカルOllama。",
     "base_url": "",
     "deploy_prefix": "",
     "chat_model": "gpt-4.1-mini",
