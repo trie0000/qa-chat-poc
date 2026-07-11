@@ -185,9 +185,11 @@ def wait_for_auth(spo):
 
 def inject_ui(cdp, spo, cfg, session_id):
     ui_url = cfg["ui_code_url"]
+    # cache-bust so the SPO-hosted latest is always fetched (not a stale cached copy)
+    bust = ui_url + ("&" if "?" in ui_url else "?") + "_=" + str(int(time.time()))
     src = cdp.evaluate(
-        "(async()=>{const r=await fetch(%s,{credentials:'include'});"
-        "if(!r.ok)throw new Error('ui fetch '+r.status);return await r.text();})()" % json.dumps(ui_url),
+        "(async()=>{const r=await fetch(%s,{cache:'no-cache',credentials:'include'});"
+        "if(!r.ok)throw new Error('ui fetch '+r.status);return await r.text();})()" % json.dumps(bust),
         await_promise=True,
     )
     if not src or len(src) < 50:
@@ -205,7 +207,8 @@ def inject_ui(cdp, spo, cfg, session_id):
     cdp.evaluate(src, await_promise=False)                 # then run the UI
 
     # reload persistence: re-inject on every new document (loader stays on SPO)
-    boot = prelude + ("(async()=>{try{const r=await fetch(%s,{credentials:'include'});"
+    boot = prelude + ("(async()=>{try{var u=%s;u+=(u.indexOf('?')>=0?'&':'?')+'_='+Date.now();"
+                      "const r=await fetch(u,{cache:'no-cache',credentials:'include'});"
                       "const t=await r.text();(0,eval)(t);}catch(e){console.warn('QA reinject',e);}})();"
                       % json.dumps(ui_url))
     try:

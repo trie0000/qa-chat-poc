@@ -64,6 +64,7 @@
     '.qa-user{align-self:flex-end;background:#2f6f5e;color:#fff}' +
     '.qa-bot{align-self:flex-start;background:#f1f0ec;color:#222}' +
     '.qa-bot.qa-wait{color:#999;font-style:italic}' +
+    '.qa-meta{align-self:flex-start;font-size:10px;color:#9a9a9a;margin-top:-4px;padding-left:4px}' +
     '.qa-foot{border-top:1px solid #eee;padding:8px;display:flex;gap:6px}' +
     '.qa-foot textarea{flex:1;resize:none;height:38px;max-height:120px;padding:8px;border:1px solid #d0d0d0;border-radius:8px;font:inherit}' +
     '.qa-foot button{width:38px;border:0;border-radius:8px;background:#2f6f5e;color:#fff;cursor:pointer;font-size:16px}' +
@@ -90,23 +91,39 @@
     body.appendChild(d); body.scrollTop = body.scrollHeight;
     return d;
   }
+  function addMeta(afterEl, text) {   // small gray line under a bubble (response time)
+    var m = document.createElement('div'); m.className = 'qa-meta'; m.textContent = text;
+    afterEl.insertAdjacentElement('afterend', m);
+    body.scrollTop = body.scrollHeight;
+  }
+  function fmt(ms) { return (ms / 1000).toFixed(1) + '秒'; }
 
   // ---- state ----------------------------------------------------------------
   var turn = 0;                 // last turn number used in this session
   var shown = {};               // itemId -> true (answer/error rendered)
   var waiting = {};             // turn -> placeholder bubble element
+  var sentAt = {};              // turn -> ms when the question was sent (response-time base)
+  var timers = {};              // turn -> live "生成中 (Ns)" counter interval id
+
+  function stopTimer(t) { if (timers[t]) { clearInterval(timers[t]); delete timers[t]; } }
 
   async function send() {
     var q = input.value.trim(); if (!q) { return; }
     input.value = '';
     turn += 1; var myTurn = turn;
     bubble('user', q);
-    waiting[myTurn] = bubble('bot', '回答生成中…', true);
+    sentAt[myTurn] = Date.now();
+    waiting[myTurn] = bubble('bot', '回答生成中… (0s)', true);
+    timers[myTurn] = setInterval(function () {           // live elapsed counter
+      var ph = waiting[myTurn];
+      if (ph) { ph.textContent = '回答生成中… (' + Math.round((Date.now() - sentAt[myTurn]) / 1000) + 's)'; }
+    }, 1000);
     try {
       await rest(BYLIST + '/items', { method: 'POST', body: {
         Title: q.slice(0, 50), Question: q, SessionId: SID, Turn: myTurn, Status: 'Pending'
       }});
     } catch (e) {
+      stopTimer(myTurn);
       if (waiting[myTurn]) { waiting[myTurn].textContent = '送信失敗: ' + e.message; waiting[myTurn].classList.remove('qa-wait'); delete waiting[myTurn]; }
     }
   }
@@ -115,9 +132,14 @@
     if (shown[it.Id]) { return; }
     if (it.Status === 'Answered') {
       shown[it.Id] = true;
+      stopTimer(it.Turn);
       var ph = waiting[it.Turn];
       if (ph) { ph.textContent = it.Answer || ''; ph.classList.remove('qa-wait'); delete waiting[it.Turn]; }
-      else { bubble('bot', it.Answer || ''); }
+      else { ph = bubble('bot', it.Answer || ''); }
+      if (sentAt[it.Turn]) {                              // ⏱ end-to-end response time (send -> shown)
+        addMeta(ph, '⏱ 応答 ' + fmt(Date.now() - sentAt[it.Turn]));
+        delete sentAt[it.Turn];
+      }
       // measurement: stamp DisplayedAt so broker can collect the UI-visible time
       rest(BYLIST + '/items(' + it.Id + ')', {
         method: 'POST', headers: { 'X-HTTP-Method': 'MERGE', 'If-Match': '*' },
@@ -125,10 +147,12 @@
       }).catch(function () {});
     } else if (it.Status === 'Error') {
       shown[it.Id] = true;
+      stopTimer(it.Turn);
       var ph2 = waiting[it.Turn];
       var msg = '⚠ ' + (it.Answer || 'エラー');
       if (ph2) { ph2.textContent = msg; ph2.classList.remove('qa-wait'); delete waiting[it.Turn]; }
       else { bubble('bot', msg); }
+      if (sentAt[it.Turn]) { delete sentAt[it.Turn]; }
     }
   }
 
