@@ -197,6 +197,16 @@ function Inject-UI {
   $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site } | ConvertTo-Json -Compress
   Eval-Value ("window.__QA_CONFIG__=$qa;true") $false | Out-Null
   Eval-Value $src $false | Out-Null
+  # Re-inject on every new document: SP redirects/SPA navigations after auth would
+  # otherwise wipe the one-shot injected panel (this is why it "injects" but nothing shows).
+  $boot = "window._spPageContextInfo=Object.assign({},window._spPageContextInfo,{webServerRelativeUrl:'$webRel'});" +
+          "window.__QA_CONFIG__=$qa;" +
+          "(async()=>{try{const r=await fetch(encodeURI($($UiUrl | ConvertTo-Json))+'?_='+Date.now()," +
+          "{cache:'no-cache',credentials:'include'});const t=await r.text();(0,eval)(t);}catch(e){console.warn('QA reinject',e);}})();"
+  try {
+    $script:Cdp.Send('Page.enable', '{}') | Out-Null
+    $script:Cdp.Send('Page.addScriptToEvaluateOnNewDocument', (@{ source = $boot } | ConvertTo-Json -Compress)) | Out-Null
+  } catch { Log "(reload persistence not set: $($_.Exception.Message))" }
   Log 'UI injected'
 }
 
