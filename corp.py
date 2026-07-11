@@ -25,25 +25,37 @@ import struct
 import requests
 
 _NO_PROXY = {"http": None, "https": None}   # corp base is loopback relay or gw; keep proxy handling explicit
-SETTING_KEYS = ["qa:segUrl", "qa:corpBase", "qa:embedDeploy", "qa:embedDim",
-                "qa:apiVersion", "qa:chatDeploy", "qa:corpKey"]
+# Settings come from the ⚙ screen; keys mirror tadori (shared localStorage) + qa:segUrl.
+SETTING_KEYS = ["qa:segUrl", "tadori:ai:corp:base-url", "tadori:ai:corp:deploy-prefix",
+                "tadori:ai:corp:model", "tadori:embedding-model", "tadori:api-version",
+                "tadori:dimensions", "tadori:ai:corp:key"]
+REASONING = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o3", "o4-mini"}   # tadori: reasoning -> preview apiVersion
 
 
 def read_settings(cdp):
-    """Read the settings screen values from the browser's localStorage via CDP."""
+    """Read settings from the browser's localStorage via CDP. Chat and embedding
+    models are separate; the Azure deployment name = prefix + model (dots removed)."""
     js = "(function(){var o={};" + "".join(
         "o['%s']=localStorage.getItem('%s');" % (k, k) for k in SETTING_KEYS) + "return JSON.stringify(o);})()"
     raw = cdp.evaluate(js, False)
     d = json.loads(raw) if raw else {}
-    dim = d.get("qa:embedDim") or ""
+    prefix = d.get("tadori:ai:corp:deploy-prefix") or ""
+    chat_model = d.get("tadori:ai:corp:model") or ""
+    embed_model = d.get("tadori:embedding-model") or ""
+    def dep(m):
+        return (prefix + m.replace(".", "")) if m else ""
+    dim = d.get("tadori:dimensions") or ""
     return {
         "seg_url": (d.get("qa:segUrl") or "").rstrip("/"),
-        "base": (d.get("qa:corpBase") or "").rstrip("/"),
-        "embed_deploy": d.get("qa:embedDeploy") or "",
+        "base": (d.get("tadori:ai:corp:base-url") or "").rstrip("/"),
+        "chat_model": chat_model,
+        "embed_model": embed_model,
+        "chat_deploy": dep(chat_model),
+        "embed_deploy": dep(embed_model),
         "dimensions": int(dim) if dim.isdigit() else None,
-        "api_version": d.get("qa:apiVersion") or "2024-02-01",
-        "chat_deploy": d.get("qa:chatDeploy") or "",
-        "api_key": d.get("qa:corpKey") or "",
+        "embed_api_version": d.get("tadori:api-version") or "2024-02-01",
+        "chat_api_version": "2024-12-01-preview" if chat_model in REASONING else "2024-06-01",
+        "api_key": d.get("tadori:ai:corp:key") or "",
     }
 
 
@@ -83,7 +95,7 @@ def decode_embedding(b64):
 
 # --- corp API (Azure OpenAI compatible) --------------------------------------
 def embed(s, text):
-    url = "%s/openai/deployments/%s/embeddings?api-version=%s" % (s["base"], s["embed_deploy"], s["api_version"])
+    url = "%s/openai/deployments/%s/embeddings?api-version=%s" % (s["base"], s["embed_deploy"], s.get("embed_api_version", "2024-02-01"))
     body = {"input": [text]}
     if s.get("dimensions"):
         body["dimensions"] = s["dimensions"]
@@ -94,7 +106,7 @@ def embed(s, text):
 
 
 def chat(s, messages):
-    url = "%s/openai/deployments/%s/chat/completions?api-version=%s" % (s["base"], s["chat_deploy"], s["api_version"])
+    url = "%s/openai/deployments/%s/chat/completions?api-version=%s" % (s["base"], s["chat_deploy"], s.get("chat_api_version", "2024-06-01"))
     r = requests.post(url, headers={"Content-Type": "application/json", "api-key": s["api_key"]},
                       json={"messages": messages}, timeout=300, proxies=_NO_PROXY)
     r.raise_for_status()

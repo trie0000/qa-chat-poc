@@ -76,7 +76,7 @@
     '.qa-modal-sub{font-size:11px;color:#888;margin-bottom:10px}' +
     '.qa-f{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}' +
     '.qa-f span{font-size:11px;color:#666}' +
-    '.qa-f input{padding:7px;border:1px solid #d0d0d0;border-radius:6px;font:inherit}' +
+    '.qa-f input,.qa-f select{padding:7px;border:1px solid #d0d0d0;border-radius:6px;font:inherit;background:#fff}' +
     '.qa-modal-ft{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}' +
     '.qa-modal-ft button{height:32px;padding:0 14px;border:0;border-radius:6px;cursor:pointer}' +
     '.qa-save{background:#2f6f5e;color:#fff}.qa-cancel{background:#f1f0ec;color:#222}';
@@ -199,14 +199,19 @@
 
   // ---- settings screen (corp API search + segments URL) ---------------------
   // Saved to localStorage; the broker reads these via CDP to run corp-API search.
+  // 回答LLM / 埋め込みモデルを別々に指定（Tadori の CORP_AI_MODELS / EMBEDDING_MODELS 準拠）。
+  var CORP_MODELS = ['gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini'];
+  var EMBED_MODELS = ['text-embedding-3-large', 'text-embedding-3-small', 'text-embedding-ada-002'];
+  // [key, type, label, placeholder, options]  — Tadori と同じ localStorage キーを流用（設定共有可）。
   var SFIELDS = [
-    ['qa:segUrl',      'SPO セグメントURL（ベクトル化済み文書の場所）', 'https://<tenant>.sharepoint.com/sites/<site>/Shared%20Documents/Tadori'],
-    ['qa:corpBase',    '社内API ベースURL（ゲートウェイ or リレー loopback）', 'http://127.0.0.1:18080'],
-    ['qa:embedDeploy', '埋め込みデプロイ名', 'text-embedding-3-large'],
-    ['qa:embedDim',    '埋め込み次元（dimensions）', '1024'],
-    ['qa:apiVersion',  'API バージョン', '2024-02-01'],
-    ['qa:chatDeploy',  '回答デプロイ名（chat）', 'gpt-4.1-mini'],
-    ['qa:corpKey',     'api-key（このブラウザにのみ保存）', ''],
+    ['tadori:ai:corp:base-url',      'text',     '社内API ベースURL（ゲートウェイ or リレー loopback）', 'https://<gateway> or http://127.0.0.1:18080', null],
+    ['tadori:ai:corp:deploy-prefix', 'text',     'デプロイ接頭辞（デプロイ名 = 接頭辞 + モデル名から「.」を除去）', '例: dev-', null],
+    ['tadori:ai:corp:model',         'select',   '回答モデル（chat LLM）', '', CORP_MODELS],
+    ['tadori:embedding-model',       'select',   '埋め込みモデル', '', EMBED_MODELS],
+    ['tadori:api-version',           'text',     '埋め込み api-version', '2024-02-01', null],
+    ['tadori:dimensions',            'text',     '埋め込み次元（dimensions）', '1024', null],
+    ['qa:segUrl',                    'text',     'SPO セグメントURL（ベクトル化済み文書の場所）', 'https://.../Shared%20Documents/Tadori', null],
+    ['tadori:ai:corp:key',           'password', 'api-key（このブラウザにのみ保存）', '', null],
   ];
   function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
@@ -214,9 +219,15 @@
   var modal = document.createElement('div');
   modal.className = 'qa-modal'; modal.style.display = 'none';
   var rows = SFIELDS.map(function (f) {
-    var typ = f[0] === 'qa:corpKey' ? 'password' : 'text';
-    return '<label class="qa-f"><span>' + f[1] + '</span>' +
-           '<input type="' + typ + '" data-k="' + f[0] + '" placeholder="' + f[2] + '"></label>';
+    var key = f[0], typ = f[1], label = f[2], ph = f[3], opts = f[4];
+    var control;
+    if (typ === 'select') {
+      control = '<select data-k="' + key + '"><option value=""></option>' +
+        opts.map(function (o) { return '<option value="' + o + '">' + o + '</option>'; }).join('') + '</select>';
+    } else {
+      control = '<input type="' + typ + '" data-k="' + key + '" placeholder="' + ph + '">';
+    }
+    return '<label class="qa-f"><span>' + label + '</span>' + control + '</label>';
   }).join('');
   modal.innerHTML = '<div class="qa-modal-box"><div class="qa-modal-h">設定（社内API検索）</div>' +
     '<div class="qa-modal-sub">ベクトル化済み文書(SPO)を社内API埋め込みで検索します。brokerがこの設定を読みます。</div>' +
