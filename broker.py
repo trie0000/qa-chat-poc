@@ -56,7 +56,8 @@ class Cdp:
         # suppress_origin: Chromium 111+ rejects CDP WS handshakes whose Origin header
         # is not in --remote-allow-origins. Sending no Origin header is accepted.
         self.ws = websocket.create_connection(ws_url, timeout=180, enable_multithread=True,
-                                              suppress_origin=True)
+                                              suppress_origin=True,
+                                              http_no_proxy=["127.0.0.1", "localhost", "::1"])
         self._id = 0
 
     def call(self, method, params=None):
@@ -156,6 +157,7 @@ NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def connect_cdp(port):
     base = "http://127.0.0.1:%d" % port
     deadline = time.time() + 120
+    last_err = "endpoint not up (debug port never opened?)"
     while time.time() < deadline:
         try:
             data = NO_PROXY_OPENER.open(base + "/json", timeout=2).read().decode("utf-8")
@@ -164,12 +166,19 @@ def connect_cdp(port):
             pref = [t for t in pages if any(s in (t.get("url") or "")
                                             for s in ("sharepoint.com", "microsoftonline", "/_forms/", "login"))]
             pick = pref or pages
-            if pick:
-                return Cdp(pick[0]["webSocketDebuggerUrl"])
-        except Exception:
-            pass
+            if not pick:
+                last_err = "no page target yet (%d targets)" % len(targets)
+            else:
+                return Cdp(pick[0]["webSocketDebuggerUrl"])   # may raise (WS handshake) -> captured below
+        except Exception as e:
+            last_err = "%s: %s" % (type(e).__name__, e)
         time.sleep(0.5)
-    raise RuntimeError("CDP page target not found on port %d" % port)
+    raise RuntimeError(
+        "CDP に接続できません (port %d)。原因: %s\n"
+        "  対処: (1) Edge を全ウィンドウ閉じてから再実行  "
+        "(2) 失敗後に http://127.0.0.1:%d/json/version をブラウザで開き、"
+        "JSONが出なければデバッグポート未開放=社内ポリシーでリモートデバッグ無効の可能性  "
+        "(3) 社内プロキシ環境変数(HTTP_PROXY等)が 127.0.0.1 を素通ししているか確認" % (port, last_err, port))
 
 
 def wait_for_auth(spo):
