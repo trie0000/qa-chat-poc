@@ -1,0 +1,173 @@
+/* =============================================================================
+ * chat-ui.js  --  QA chat overlay (browser side)
+ * -----------------------------------------------------------------------------
+ * Deployed to an SPO document library; fetched + injected by broker.py via CDP.
+ * Runs inside the authenticated SharePoint page, talks to SPO REST with the
+ * browser's own session (credentials: 'include'). No secrets here.
+ *
+ * broker injects window.__QA_CONFIG__ = { listTitle, sessionId, pollIntervalMs, webUrl }
+ * BEFORE evaluating this file.
+ * ========================================================================== */
+(function () {
+  if (window.__QA_UI_MOUNTED__) { return; }   // idempotent (survives re-inject)
+  window.__QA_UI_MOUNTED__ = true;
+
+  var CFG  = window.__QA_CONFIG__ || {};
+  var WEB  = String(CFG.webUrl || location.origin).replace(/\/+$/, '');
+  var LIST = CFG.listTitle || 'QA_PoC';
+  var POLL = CFG.pollIntervalMs || 2500;
+  // session continuity across reloads; broker's id is the seed for a fresh run
+  var SID  = sessionStorage.getItem('qa_sid') || CFG.sessionId;
+  sessionStorage.setItem('qa_sid', SID);
+
+  var BYLIST = "/_api/web/lists/getbytitle('" + encodeURIComponent(LIST) + "')";
+
+  // ---- REST helpers (shared digest) ----------------------------------------
+  var _digest = null, _digestExp = 0;
+  async function digest() {
+    if (_digest && Date.now() < _digestExp) { return _digest; }
+    var r = await fetch(encodeURI(WEB + '/_api/contextinfo'), {
+      method: 'POST', headers: { Accept: 'application/json;odata=nometadata' }, credentials: 'include'
+    });
+    var j = await r.json();
+    _digest = j.FormDigestValue;
+    _digestExp = Date.now() + ((j.FormDigestTimeoutSeconds || 1800) - 300) * 1000;
+    return _digest;
+  }
+  async function rest(rel, opt) {
+    opt = opt || {};
+    var method = opt.method || 'GET';
+    var headers = Object.assign({ Accept: 'application/json;odata=nometadata' }, opt.headers || {});
+    if (opt.body != null) { headers['Content-Type'] = 'application/json;odata=nometadata'; }
+    if (method !== 'GET') { headers['X-RequestDigest'] = await digest(); }
+    var init = { method: method, headers: headers, credentials: 'include' };
+    if (opt.body != null) { init.body = JSON.stringify(opt.body); }
+    var r = await fetch(encodeURI(WEB + rel), init);
+    if (r.status === 403 && method !== 'GET') {          // digest expired -> refresh once
+      _digest = null; headers['X-RequestDigest'] = await digest();
+      r = await fetch(encodeURI(WEB + rel), init);
+    }
+    var text = await r.text(); var json = null; try { json = JSON.parse(text); } catch (e) {}
+    if (!r.ok) { throw new Error(method + ' ' + rel + ' -> ' + r.status + ' ' + text.slice(0, 200)); }
+    return json;
+  }
+
+  // ---- styles + DOM ---------------------------------------------------------
+  var css =
+    '.qa-panel{position:fixed;right:20px;bottom:20px;width:360px;height:520px;z-index:2147483000;' +
+    'display:flex;flex-direction:column;background:#fff;border:1px solid #d0d0d0;border-radius:10px;' +
+    'box-shadow:0 8px 30px rgba(0,0,0,.18);font-family:"Meiryo","Segoe UI",system-ui,sans-serif;font-size:13px;color:#222}' +
+    '.qa-head{padding:10px 12px;font-weight:700;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center}' +
+    '.qa-head small{font-weight:400;color:#888;font-size:11px}' +
+    '.qa-body{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}' +
+    '.qa-msg{max-width:82%;padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;line-height:1.5}' +
+    '.qa-user{align-self:flex-end;background:#2f6f5e;color:#fff}' +
+    '.qa-bot{align-self:flex-start;background:#f1f0ec;color:#222}' +
+    '.qa-bot.qa-wait{color:#999;font-style:italic}' +
+    '.qa-foot{border-top:1px solid #eee;padding:8px;display:flex;gap:6px}' +
+    '.qa-foot textarea{flex:1;resize:none;height:38px;max-height:120px;padding:8px;border:1px solid #d0d0d0;border-radius:8px;font:inherit}' +
+    '.qa-foot button{width:38px;border:0;border-radius:8px;background:#2f6f5e;color:#fff;cursor:pointer;font-size:16px}' +
+    '.qa-foot button:disabled{opacity:.4;cursor:default}';
+  var style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+  var panel = document.createElement('div'); panel.className = 'qa-panel';
+  panel.innerHTML =
+    '<div class="qa-head"><span>QA チャット <small>PoC</small></span><small class="qa-sid"></small></div>' +
+    '<div class="qa-body"></div>' +
+    '<div class="qa-foot"><textarea placeholder="質問を入力 (Enterで送信)"></textarea><button title="送信">&#9658;</button></div>';
+  document.body.appendChild(panel);
+
+  var body = panel.querySelector('.qa-body');
+  var input = panel.querySelector('textarea');
+  var btn = panel.querySelector('button');
+  panel.querySelector('.qa-sid').textContent = 'sid:' + String(SID).slice(0, 8);
+  input.disabled = true; btn.disabled = true;
+
+  function bubble(role, text, wait) {
+    var d = document.createElement('div');
+    d.className = 'qa-msg ' + (role === 'user' ? 'qa-user' : 'qa-bot') + (wait ? ' qa-wait' : '');
+    d.textContent = text;
+    body.appendChild(d); body.scrollTop = body.scrollHeight;
+    return d;
+  }
+
+  // ---- state ----------------------------------------------------------------
+  var turn = 0;                 // last turn number used in this session
+  var shown = {};               // itemId -> true (answer/error rendered)
+  var waiting = {};             // turn -> placeholder bubble element
+
+  async function send() {
+    var q = input.value.trim(); if (!q) { return; }
+    input.value = '';
+    turn += 1; var myTurn = turn;
+    bubble('user', q);
+    waiting[myTurn] = bubble('bot', '回答生成中…', true);
+    try {
+      await rest(BYLIST + '/items', { method: 'POST', body: {
+        Title: q.slice(0, 50), Question: q, SessionId: SID, Turn: myTurn, Status: 'Pending'
+      }});
+    } catch (e) {
+      if (waiting[myTurn]) { waiting[myTurn].textContent = '送信失敗: ' + e.message; waiting[myTurn].classList.remove('qa-wait'); delete waiting[myTurn]; }
+    }
+  }
+
+  function render(it) {
+    if (shown[it.Id]) { return; }
+    if (it.Status === 'Answered') {
+      shown[it.Id] = true;
+      var ph = waiting[it.Turn];
+      if (ph) { ph.textContent = it.Answer || ''; ph.classList.remove('qa-wait'); delete waiting[it.Turn]; }
+      else { bubble('bot', it.Answer || ''); }
+      // measurement: stamp DisplayedAt so broker can collect the UI-visible time
+      rest(BYLIST + '/items(' + it.Id + ')', {
+        method: 'POST', headers: { 'X-HTTP-Method': 'MERGE', 'If-Match': '*' },
+        body: { DisplayedAt: new Date().toISOString() }
+      }).catch(function () {});
+    } else if (it.Status === 'Error') {
+      shown[it.Id] = true;
+      var ph2 = waiting[it.Turn];
+      var msg = '⚠ ' + (it.Answer || 'エラー');
+      if (ph2) { ph2.textContent = msg; ph2.classList.remove('qa-wait'); delete waiting[it.Turn]; }
+      else { bubble('bot', msg); }
+    }
+  }
+
+  async function poll() {
+    try {
+      var res = await rest(BYLIST + "/items?$select=Id,Turn,Answer,Status&$filter=SessionId eq '" + SID +
+                           "'&$orderby=Turn asc&$top=200");
+      var rows = (res && res.value) || [];
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].Turn > turn) { turn = rows[i].Turn; }
+        render(rows[i]);
+      }
+    } catch (e) { /* transient; keep polling */ }
+    setTimeout(poll, POLL);
+  }
+
+  async function init() {
+    try {
+      var res = await rest(BYLIST + "/items?$select=Id,Turn,Question,Answer,Status&$filter=SessionId eq '" + SID +
+                           "'&$orderby=Turn asc&$top=200");
+      var rows = (res && res.value) || [];
+      rows.forEach(function (it) {
+        if (it.Question) { bubble('user', it.Question); }
+        if (it.Status === 'Answered') { bubble('bot', it.Answer || ''); shown[it.Id] = true; }
+        else if (it.Status === 'Error') { bubble('bot', '⚠ ' + (it.Answer || '')); shown[it.Id] = true; }
+        if (it.Turn > turn) { turn = it.Turn; }
+      });
+    } catch (e) { bubble('bot', '初期化エラー: ' + e.message); }
+    input.disabled = false; btn.disabled = false; input.focus();
+    poll();
+  }
+
+  btn.addEventListener('click', send);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      if (e.isComposing || e.keyCode === 229) { return; }   // IME 変換確定Enterを送信にしない
+      e.preventDefault(); send();
+    }
+  });
+
+  init();
+})();

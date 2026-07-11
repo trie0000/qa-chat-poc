@@ -1,0 +1,12 @@
+{
+  "site_url": "https://YOUR-TENANT.sharepoint.com/sites/YOUR-SITE",
+  "list_title": "QA_PoC",
+  "ui_code_url": "https://YOUR-TENANT.sharepoint.com/sites/YOUR-SITE/Shared%20Documents/qa-chat-poc/chat-ui.js",
+  "browser_path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "cdp_port": 9222,
+  "ollama_endpoint": "http://localhost:11434",
+  "ollama_model": "gemma3:4b",
+  "poll_interval_ms": 2500,
+  "history_max_turns": 10,
+  "system_prompt": "あなたは社内システムマニュアルのQAアシスタントです。簡潔に日本語で回答してください。"
+}

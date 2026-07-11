@@ -1,0 +1,13 @@
+# local config (contains real SPO site URL -- not committed)
+config.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# browser profile created by broker
+.edgeprofile/
+
+# measurement output
+logs/*.csv
