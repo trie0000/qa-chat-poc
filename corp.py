@@ -21,10 +21,17 @@ import base64
 import json
 import math
 import struct
+from urllib.parse import urlparse
 
 import requests
 
-_NO_PROXY = {"http": None, "https": None}   # corp base is loopback relay or gw; keep proxy handling explicit
+
+def _proxies_for(base):
+    # base can be a loopback relay OR the corp gateway directly:
+    #   - loopback (127.0.0.1/localhost) -> bypass the corporate proxy
+    #   - remote gateway                 -> go through it (requests honors env HTTP(S)_PROXY)
+    host = (urlparse(base).hostname or "").lower()
+    return {"http": None, "https": None} if host in ("127.0.0.1", "localhost", "::1") else None
 # Settings come from the ⚙ screen; keys mirror tadori (shared localStorage) + qa:segUrl.
 SETTING_KEYS = ["qa:segUrl", "tadori:ai:corp:base-url", "tadori:ai:corp:deploy-prefix",
                 "tadori:ai:corp:model", "tadori:embedding-model", "tadori:api-version",
@@ -100,7 +107,7 @@ def embed(s, text):
     if s.get("dimensions"):
         body["dimensions"] = s["dimensions"]
     r = requests.post(url, headers={"Content-Type": "application/json", "api-key": s["api_key"]},
-                      json=body, timeout=120, proxies=_NO_PROXY)
+                      json=body, timeout=120, proxies=_proxies_for(s["base"]))
     r.raise_for_status()
     return r.json()["data"][0]["embedding"]
 
@@ -108,7 +115,7 @@ def embed(s, text):
 def chat(s, messages):
     url = "%s/openai/deployments/%s/chat/completions?api-version=%s" % (s["base"], s["chat_deploy"], s.get("chat_api_version", "2024-06-01"))
     r = requests.post(url, headers={"Content-Type": "application/json", "api-key": s["api_key"]},
-                      json={"messages": messages}, timeout=300, proxies=_NO_PROXY)
+                      json={"messages": messages}, timeout=300, proxies=_proxies_for(s["base"]))
     r.raise_for_status()
     return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
