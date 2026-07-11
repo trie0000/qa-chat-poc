@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from urllib.parse import urlparse, unquote
 
 import requests
 import websocket  # websocket-client
@@ -31,6 +32,18 @@ import corp  # corporate-API search backend (embeddings + chat + SPO segments)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYSTEM = "あなたは社内システムマニュアルのQAアシスタントです。簡潔に日本語で回答してください。"
+
+# QA_PoC list columns (internal name -> SchemaXml), created on first launch.
+FIELDS_XML = [
+    ("Question",    "<Field Type='Note' DisplayName='Question' Name='Question' StaticName='Question' NumLines='6' RichText='FALSE'/>"),
+    ("Answer",      "<Field Type='Note' DisplayName='Answer' Name='Answer' StaticName='Answer' NumLines='6' RichText='FALSE'/>"),
+    ("SessionId",   "<Field Type='Text' DisplayName='SessionId' Name='SessionId' StaticName='SessionId'/>"),
+    ("Turn",        "<Field Type='Number' DisplayName='Turn' Name='Turn' StaticName='Turn'/>"),
+    ("Status",      "<Field Type='Choice' DisplayName='Status' Name='Status' StaticName='Status'><CHOICES><CHOICE>Pending</CHOICE><CHOICE>Detected</CHOICE><CHOICE>Answering</CHOICE><CHOICE>Answered</CHOICE><CHOICE>Error</CHOICE></CHOICES></Field>"),
+    ("DetectedAt",  "<Field Type='DateTime' DisplayName='DetectedAt' Name='DetectedAt' StaticName='DetectedAt' Format='DateTime'/>"),
+    ("AnsweredAt",  "<Field Type='DateTime' DisplayName='AnsweredAt' Name='AnsweredAt' StaticName='AnsweredAt' Format='DateTime'/>"),
+    ("DisplayedAt", "<Field Type='DateTime' DisplayName='DisplayedAt' Name='DisplayedAt' StaticName='DisplayedAt' Format='DateTime'/>"),
+]
 
 
 def log(msg):
@@ -193,6 +206,48 @@ def wait_for_auth(spo):
         except Exception:
             pass
         time.sleep(2)
+
+
+def ensure_setup(cdp, spo, cfg):
+    """First-run (idempotent): create the QA_PoC list + columns and upload chat-ui.js
+    to the SPO library path in ui_code_url. Safe to run every launch."""
+    list_title = cfg.get("list_title", "QA_PoC")
+    by_list = "/_api/web/lists/getbytitle('%s')" % list_title
+
+    if not spo.raw(by_list + "?$select=Title").get("ok"):
+        cr = spo.write("/_api/web/lists", {"BaseTemplate": 100, "Title": list_title,
+                                           "Description": "QA chat PoC", "ContentTypesEnabled": False})
+        log("created list '%s' (%s)" % (list_title, cr.get("status")))
+
+    existing = set(f["InternalName"] for f in
+                   (spo.raw(by_list + "/fields?$select=InternalName&$top=500").get("json") or {}).get("value", []))
+    added = 0
+    for name, xml in FIELDS_XML:
+        if name in existing:
+            continue
+        body = {"parameters": {"__metadata": {"type": "SP.XmlSchemaFieldCreationInformation"}, "SchemaXml": xml, "Options": 12}}
+        res = spo.raw(by_list + "/fields/createfieldasxml", method="POST", body=body, odata="verbose", use_digest=True)
+        if not res.get("ok") and res.get("status") == 403:
+            spo._digest = None
+            res = spo.raw(by_list + "/fields/createfieldasxml", method="POST", body=body, odata="verbose", use_digest=True)
+        if res.get("ok"):
+            added += 1
+        else:
+            log("  column %s failed: %s %s" % (name, res.get("status"), (res.get("text") or "")[:100]))
+    if added:
+        log("added %d columns" % added)
+
+    # upload chat-ui.js from the local copy to the library path in ui_code_url
+    folder, filename = unquote(urlparse(cfg["ui_code_url"]).path).rsplit("/", 1)
+    spo.raw("/_api/web/folders/addUsingPath(DecodedUrl='" + folder + "')", method="POST", use_digest=True)
+    src = open(os.path.join(HERE, "sharepoint", "chat-ui.js"), "r", encoding="utf-8").read()
+    digest = spo.digest()
+    up = spo.site + "/_api/web/GetFolderByServerRelativeUrl('" + folder + "')/Files/add(url='" + filename + "',overwrite=true)"
+    js = ("(async()=>{const r=await fetch(encodeURI(%s),{method:'POST',headers:{'X-RequestDigest':%s,"
+          "'Accept':'application/json;odata=nometadata'},credentials:'include',body:%s});return{status:r.status,ok:r.ok};})()"
+          % (json.dumps(up), json.dumps(digest), json.dumps(src)))
+    r = cdp.evaluate(js, await_promise=True)
+    log("chat-ui.js uploaded (%s)" % ("ok" if r.get("ok") else r.get("status")))
 
 
 def inject_ui(cdp, spo, cfg, session_id):
@@ -411,6 +466,7 @@ def main():
     log("CDP connected")
     spo = Spo(cdp, cfg["site_url"])
     wait_for_auth(spo)
+    ensure_setup(cdp, spo, cfg)   # first-run: auto-create list + columns + upload chat-ui.js (idempotent)
     inject_ui(cdp, spo, cfg, session_id)
     log("UI injected")
 

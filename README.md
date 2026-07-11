@@ -47,16 +47,31 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 
 ---
 
-## セットアップ
+## セットアップ（別環境・ゼロから）
 
-1. **リスト作成**: `setup/create-list.ps1`（PnP）か、上表どおり手動で `QA_PoC` を作成。
-2. **UI配置**: `sharepoint/chat-ui.js` を SPO のドキュメントライブラリ（例 `Shared Documents/qa-chat-poc/`）にアップロード。
-3. **PA作成**: `setup/README-PA-flow.md` に従い「作成トリガー → Detected 更新」フローを作成。
-4. **設定**: `copy config.example.json config.json` して各値を設定
-   （`site_url` / `list_title` / `ui_code_url` / `browser_path` / `ollama_endpoint` / `ollama_model` ...）。
-5. **依存**: `python -m venv .venv` → `.venv\Scripts\pip install websocket-client requests`。
-6. **Ollama**: 回答用と埋め込み用のモデルを pull（既定 `ollama pull qwen2.5:7b` と `ollama pull bge-m3`）。サービスを起動。
-7. **ナレッジ索引**: `python build_index.py` で `knowledge/manual.md` をチャンク化＋ベクトル化して `knowledge/index.json` を生成（マニュアルを更新したら再実行）。
+> **上表の QA_PoC リスト・列と chat-ui.js の SPO 配置は、broker が初回起動時に自動作成**します。
+> 手動のリスト作成/アップロードは不要です（`setup/create-list.ps1` は参考用に残置）。
+
+1. **前提**: Python 3.10+ / git（ローカルAIで動かすなら Ollama も）。
+2. **clone + 依存**:
+   ```
+   git clone https://github.com/trie0000/qa-chat-poc
+   cd qa-chat-poc
+   python -m venv .venv
+   .venv\Scripts\pip install websocket-client requests
+   ```
+3. **設定**: `copy config.example.json config.json` → `site_url` を実 SharePoint サイトに、
+   `ui_code_url` を「そのサイト/Shared%20Documents/qa-chat-poc/chat-ui.js」に書き換え
+   （`browser_path` は Edge のパス。既定のままで大抵OK）。
+4. **（ローカルAIモードなら）モデル＋索引**:
+   ```
+   ollama pull qwen2.5:7b
+   ollama pull bge-m3
+   python build_index.py
+   ```
+   ※社内API検索モードで使うなら Ollama/索引は不要（起動後に ⚙ で社内API設定）。
+5. **PAフロー作成**: `setup/README-PA-flow.md`（作成トリガー → `Status=Detected` / `DetectedAt=utcNow()`）。
+6. **起動**: `start.bat`。**初回起動でリスト・列・chat-ui.js を自動生成**し、サインイン後にチャットが立ち上がる。
 
 ## 実行
 
