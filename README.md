@@ -112,6 +112,26 @@ start.bat をダブルクリック
 > 同じ `build_index.py` の流れ（チャンク→埋め込み→index.json）に載せれば同様に使えます。
 > 画像内の文字は OCR しない限り取り込めない点に注意。
 
+## 社内API検索モード（Tadori セグメント / Azure OpenAI 互換）
+
+ローカル Ollama RAG の代わりに、**社内API（Azure OpenAI互換）で検索・回答**し、
+**Tadori が事前ベクトル化して SPO に置いた文書（セグメント）**を知識源にできます。
+
+- **設定画面**（チャットパネル右上の ⚙）で以下を指定 → localStorage に保存：
+  - **SPO セグメントURL**（ベクトル化済み文書の場所）／社内API ベースURL（ゲートウェイ or リレー loopback）／
+    埋め込みデプロイ名／dimensions／api-version／回答デプロイ名／api-key
+- **broker** はこの設定を **CDP 経由で読み**、設定が揃っていれば **社内API検索モード**に切り替わる（未設定ならローカル Ollama にフォールバック）：
+  1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
+  2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み
+  3. L2 正規化 cosine で Top-K
+  4. **社内API `…/openai/deployments/<chat>/chat/completions`** で回答生成
+- **経路**：質問者は直接 APIを叩かず、**API実行権限を持つ運用者が動かす broker が社内API（リレー経由可）を呼ぶ**。
+  SPO 認証は既存の bat/CDP で統一。
+
+> ⚠ **未接続検証**：社内API・api-key・実 Tadori セグメントは開発環境から到達できないため、実接続の E2E はここでは未検証。
+> 実装は Tadori の契約（`src/embeddings/client.ts` 等）に厳密準拠し、**リクエスト形式・float16デコード・cosine・設定読込はモックで確認済み**。
+> セグメントのファイル構成（manifest + seg ファイル）は Tadori の想定形式を仮定しているので、実出力が異なる場合は `corp.load_segments()` を調整する。
+
 ## 技術メモ / 制約
 
 - **Python から SPO へ直接 HTTP しない**（認証を持たないため）。必ず CDP → ブラウザ `fetch` 経由。

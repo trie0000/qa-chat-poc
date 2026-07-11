@@ -27,6 +27,8 @@ import uuid
 import requests
 import websocket  # websocket-client
 
+import corp  # corporate-API search backend (embeddings + chat + SPO segments)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYSTEM = "あなたは社内システムマニュアルのQAアシスタントです。簡潔に日本語で回答してください。"
 
@@ -274,7 +276,7 @@ def build_system(cfg, chunks):
     return system
 
 
-def build_messages(spo, by_list, cfg, session_id, cur_turn, cur_question, index):
+def build_messages(spo, by_list, cfg, session_id, cur_turn, cur_question, rag):
     hist_max = cfg.get("history_max_turns", 10)
     q = (by_list + "/items?$select=Turn,Question,Answer&$filter=SessionId eq '%s' and Status eq 'Answered'"
          "&$orderby=Turn asc&$top=200") % session_id
@@ -282,9 +284,12 @@ def build_messages(spo, by_list, cfg, session_id, cur_turn, cur_question, index)
     rows = [r for r in ((res.get("json") or {}).get("value", [])) if r.get("Turn", 0) < cur_turn]
     rows = rows[-hist_max:]
 
-    chunks = retrieve(cfg, index, cur_question)
+    if rag.get("mode") == "corp":
+        chunks = corp.search(rag["cdp"], rag["settings"], rag["segments"], cur_question, cfg.get("top_k", 4))
+    else:
+        chunks = retrieve(cfg, rag.get("index"), cur_question)
     if chunks:
-        log("retrieved: %s" % [c["section"] for c in chunks])
+        log("retrieved: %s" % [c.get("section") for c in chunks])
     messages = [{"role": "system", "content": build_system(cfg, chunks)}]
     for r in rows:
         messages.append({"role": "user", "content": (r.get("Question") or "")[:2000]})
@@ -318,7 +323,7 @@ def log_latency(row):
 
 
 # --- main loop ---------------------------------------------------------------
-def handle_detected(spo, by_list, cfg, session_id, it, picked, index):
+def handle_detected(spo, by_list, cfg, session_id, it, picked, rag):
     item_id = it["Id"]
     turn = it.get("Turn", 0)
     etag = it.get("odata.etag") or "*"
@@ -335,8 +340,8 @@ def handle_detected(spo, by_list, cfg, session_id, it, picked, index):
     log("picked item %d (turn %d)" % (item_id, turn))
 
     try:
-        messages = build_messages(spo, by_list, cfg, session_id, turn, it.get("Question", ""), index)
-        answer = ollama_chat(cfg, messages)
+        messages = build_messages(spo, by_list, cfg, session_id, turn, it.get("Question", ""), rag)
+        answer = corp.chat(rag["settings"], messages) if rag.get("mode") == "corp" else ollama_chat(cfg, messages)
         spo.write(by_list + "/items(%d)" % item_id,
                   {"Answer": answer, "Status": "Answered", "AnsweredAt": utcnow()},
                   extra_headers={"X-HTTP-Method": "MERGE", "If-Match": "*"})
@@ -369,7 +374,7 @@ def reap_latency(spo, by_list, session_id, picked, logged):
         logged.add(it["Id"])
 
 
-def monitor(spo, cfg, session_id, index):
+def monitor(spo, cfg, session_id, rag):
     by_list = "/_api/web/lists/getbytitle('%s')" % cfg["list_title"]
     poll_s = cfg.get("poll_interval_ms", 2500) / 1000.0
     picked = {}     # item_id -> broker pick time
@@ -381,7 +386,7 @@ def monitor(spo, cfg, session_id, index):
                  "&$orderby=Turn asc&$top=50") % session_id
             res = spo.raw(q, odata="minimalmetadata")  # minimalmetadata -> per-item odata.etag
             for it in (res.get("json") or {}).get("value", []):
-                handle_detected(spo, by_list, cfg, session_id, it, picked, index)
+                handle_detected(spo, by_list, cfg, session_id, it, picked, rag)
             reap_latency(spo, by_list, session_id, picked, logged)
         except Exception as e:
             log("monitor loop error: %s" % e)
@@ -399,12 +404,23 @@ def main():
     wait_for_auth(spo)
     inject_ui(cdp, spo, cfg, session_id)
     log("UI injected")
-    index = load_index(cfg)
-    if index:
-        log("knowledge index: %d chunks (model=%s)" % (len(index.get("chunks", [])), index.get("model")))
-    else:
-        log("knowledge index: none (plain chat, no RAG)")
-    monitor(spo, cfg, session_id, index)
+
+    # Retrieval backend: corp API (if settings screen is configured) else local Ollama index.
+    cs = corp.read_settings(cdp)
+    rag = None
+    if corp.enabled(cs):
+        try:
+            segments = corp.load_segments(cdp, cs["seg_url"])
+            rag = {"mode": "corp", "settings": cs, "segments": segments, "cdp": cdp}
+            log("corp search ON: %d segments (base=%s embed=%s chat=%s)"
+                % (len(segments), cs["base"], cs["embed_deploy"], cs["chat_deploy"]))
+        except Exception as e:
+            log("corp segments load failed (%s) -> falling back to local Ollama" % e)
+    if rag is None:
+        index = load_index(cfg)
+        rag = {"mode": "local", "index": index}
+        log("local Ollama RAG: %d chunks" % len(index.get("chunks", [])) if index else "no knowledge (plain chat)")
+    monitor(spo, cfg, session_id, rag)
 
 
 if __name__ == "__main__":

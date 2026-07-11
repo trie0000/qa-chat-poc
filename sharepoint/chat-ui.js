@@ -68,12 +68,24 @@
     '.qa-foot{border-top:1px solid #eee;padding:8px;display:flex;gap:6px}' +
     '.qa-foot textarea{flex:1;resize:none;height:38px;max-height:120px;padding:8px;border:1px solid #d0d0d0;border-radius:8px;font:inherit}' +
     '.qa-foot button{width:38px;border:0;border-radius:8px;background:#2f6f5e;color:#fff;cursor:pointer;font-size:16px}' +
-    '.qa-foot button:disabled{opacity:.4;cursor:default}';
+    '.qa-foot button:disabled{opacity:.4;cursor:default}' +
+    '.qa-gear{border:0;background:transparent;cursor:pointer;font-size:15px;color:#888;padding:0 4px}' +
+    '.qa-modal{position:fixed;inset:0;z-index:2147483001;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center}' +
+    '.qa-modal-box{background:#fff;border-radius:10px;width:440px;max-width:92vw;max-height:88vh;overflow:auto;padding:16px;font-family:"Meiryo","Segoe UI",system-ui,sans-serif;font-size:13px;color:#222}' +
+    '.qa-modal-h{font-weight:700;margin-bottom:4px}' +
+    '.qa-modal-sub{font-size:11px;color:#888;margin-bottom:10px}' +
+    '.qa-f{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}' +
+    '.qa-f span{font-size:11px;color:#666}' +
+    '.qa-f input{padding:7px;border:1px solid #d0d0d0;border-radius:6px;font:inherit}' +
+    '.qa-modal-ft{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}' +
+    '.qa-modal-ft button{height:32px;padding:0 14px;border:0;border-radius:6px;cursor:pointer}' +
+    '.qa-save{background:#2f6f5e;color:#fff}.qa-cancel{background:#f1f0ec;color:#222}';
   var style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
 
   var panel = document.createElement('div'); panel.className = 'qa-panel';
   panel.innerHTML =
-    '<div class="qa-head"><span>QA チャット <small>PoC</small></span><small class="qa-sid"></small></div>' +
+    '<div class="qa-head"><span>QA チャット <small>PoC</small></span>' +
+      '<span><button class="qa-gear" title="設定">⚙</button><small class="qa-sid"></small></span></div>' +
     '<div class="qa-body"></div>' +
     '<div class="qa-foot"><textarea placeholder="質問を入力 (Enterで送信)"></textarea><button title="送信">&#9658;</button></div>';
   document.body.appendChild(panel);
@@ -184,6 +196,44 @@
     input.disabled = false; btn.disabled = false; input.focus();
     poll();
   }
+
+  // ---- settings screen (corp API search + segments URL) ---------------------
+  // Saved to localStorage; the broker reads these via CDP to run corp-API search.
+  var SFIELDS = [
+    ['qa:segUrl',      'SPO セグメントURL（ベクトル化済み文書の場所）', 'https://<tenant>.sharepoint.com/sites/<site>/Shared%20Documents/Tadori'],
+    ['qa:corpBase',    '社内API ベースURL（ゲートウェイ or リレー loopback）', 'http://127.0.0.1:18080'],
+    ['qa:embedDeploy', '埋め込みデプロイ名', 'text-embedding-3-large'],
+    ['qa:embedDim',    '埋め込み次元（dimensions）', '1024'],
+    ['qa:apiVersion',  'API バージョン', '2024-02-01'],
+    ['qa:chatDeploy',  '回答デプロイ名（chat）', 'gpt-4.1-mini'],
+    ['qa:corpKey',     'api-key（このブラウザにのみ保存）', ''],
+  ];
+  function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+  var modal = document.createElement('div');
+  modal.className = 'qa-modal'; modal.style.display = 'none';
+  var rows = SFIELDS.map(function (f) {
+    var typ = f[0] === 'qa:corpKey' ? 'password' : 'text';
+    return '<label class="qa-f"><span>' + f[1] + '</span>' +
+           '<input type="' + typ + '" data-k="' + f[0] + '" placeholder="' + f[2] + '"></label>';
+  }).join('');
+  modal.innerHTML = '<div class="qa-modal-box"><div class="qa-modal-h">設定（社内API検索）</div>' +
+    '<div class="qa-modal-sub">ベクトル化済み文書(SPO)を社内API埋め込みで検索します。brokerがこの設定を読みます。</div>' +
+    rows + '<div class="qa-modal-ft"><button class="qa-cancel">閉じる</button><button class="qa-save">保存</button></div></div>';
+  document.body.appendChild(modal);
+
+  function openSettings() {
+    SFIELDS.forEach(function (f) { modal.querySelector('[data-k="' + f[0] + '"]').value = lsGet(f[0]); });
+    modal.style.display = 'flex';
+  }
+  modal.querySelector('.qa-save').addEventListener('click', function () {
+    SFIELDS.forEach(function (f) { lsSet(f[0], modal.querySelector('[data-k="' + f[0] + '"]').value.trim()); });
+    modal.style.display = 'none';
+  });
+  modal.querySelector('.qa-cancel').addEventListener('click', function () { modal.style.display = 'none'; });
+  modal.addEventListener('click', function (e) { if (e.target === modal) { modal.style.display = 'none'; } });
+  panel.querySelector('.qa-gear').addEventListener('click', openSettings);
 
   btn.addEventListener('click', send);
   input.addEventListener('keydown', function (e) {
