@@ -16,6 +16,7 @@
 import csv
 import datetime
 import json
+import math
 import os
 import subprocess
 import sys
@@ -218,15 +219,73 @@ def inject_ui(cdp, spo, cfg, session_id):
         log("(reload persistence not set: %s)" % e)
 
 
+# --- retrieval (RAG over the pre-computed manual index) ----------------------
+def load_index(cfg):
+    path = cfg.get("knowledge_index")
+    if not path:
+        return None
+    p = path if os.path.isabs(path) else os.path.join(HERE, path)
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _cosine(a, b):
+    dot = 0.0; na = 0.0; nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y; na += x * x; nb += y * y
+    return dot / (math.sqrt(na) * math.sqrt(nb)) if na and nb else 0.0
+
+
+def embed_query(cfg, text):
+    url = cfg.get("ollama_endpoint", "http://localhost:11434").rstrip("/") + "/api/embeddings"
+    # nomic-embed-text query prefix (must match the "search_document:" prefix used at build time)
+    prompt = "search_query: " + text if str(cfg.get("embed_model", "")).startswith("nomic") else text
+    r = requests.post(url, json={"model": cfg.get("embed_model", "nomic-embed-text"), "prompt": prompt},
+                      timeout=120, proxies={"http": None, "https": None})
+    r.raise_for_status()
+    return r.json()["embedding"]
+
+
+def retrieve(cfg, index, question):
+    if not index or not index.get("chunks"):
+        return []
+    q = embed_query(cfg, question)
+    scored = [(_cosine(q, c["embedding"]), c) for c in index["chunks"]]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [c for _, c in scored[: cfg.get("top_k", 4)]]
+
+
 # --- answer generation -------------------------------------------------------
-def build_messages(spo, by_list, cfg, session_id, cur_turn, cur_question):
+def build_system(cfg, chunks):
+    """System prompt + retrieved context. Framed as 'read then answer' (not
+    refuse-first) so smaller models still extract facts that are present."""
+    system = cfg.get("system_prompt", DEFAULT_SYSTEM)
+    if chunks:
+        ctx = "\n\n".join("【%s】\n%s" % (c["section"], c["text"]) for c in chunks)
+        system += (
+            "\n\n以下の【参考資料】をよく読み、質問に答えてください。"
+            "\n- 参考資料に根拠がある場合は、その内容（数値・条件も含む）を使って具体的に答えてください。"
+            "\n- 参考資料のどこにも関連する記述が無い場合に限り「資料に記載がありません」と答えてください。"
+            "\n- 最後に参照した見出しを示してください。"
+            "\n\n===== 参考資料 =====\n" + ctx
+        )
+    return system
+
+
+def build_messages(spo, by_list, cfg, session_id, cur_turn, cur_question, index):
     hist_max = cfg.get("history_max_turns", 10)
     q = (by_list + "/items?$select=Turn,Question,Answer&$filter=SessionId eq '%s' and Status eq 'Answered'"
          "&$orderby=Turn asc&$top=200") % session_id
     res = spo.raw(q)
     rows = [r for r in ((res.get("json") or {}).get("value", [])) if r.get("Turn", 0) < cur_turn]
     rows = rows[-hist_max:]
-    messages = [{"role": "system", "content": cfg.get("system_prompt", DEFAULT_SYSTEM)}]
+
+    chunks = retrieve(cfg, index, cur_question)
+    if chunks:
+        log("retrieved: %s" % [c["section"] for c in chunks])
+    messages = [{"role": "system", "content": build_system(cfg, chunks)}]
     for r in rows:
         messages.append({"role": "user", "content": (r.get("Question") or "")[:2000]})
         messages.append({"role": "assistant", "content": (r.get("Answer") or "")[:2000]})
@@ -259,7 +318,7 @@ def log_latency(row):
 
 
 # --- main loop ---------------------------------------------------------------
-def handle_detected(spo, by_list, cfg, session_id, it, picked):
+def handle_detected(spo, by_list, cfg, session_id, it, picked, index):
     item_id = it["Id"]
     turn = it.get("Turn", 0)
     etag = it.get("odata.etag") or "*"
@@ -276,7 +335,7 @@ def handle_detected(spo, by_list, cfg, session_id, it, picked):
     log("picked item %d (turn %d)" % (item_id, turn))
 
     try:
-        messages = build_messages(spo, by_list, cfg, session_id, turn, it.get("Question", ""))
+        messages = build_messages(spo, by_list, cfg, session_id, turn, it.get("Question", ""), index)
         answer = ollama_chat(cfg, messages)
         spo.write(by_list + "/items(%d)" % item_id,
                   {"Answer": answer, "Status": "Answered", "AnsweredAt": utcnow()},
@@ -310,7 +369,7 @@ def reap_latency(spo, by_list, session_id, picked, logged):
         logged.add(it["Id"])
 
 
-def monitor(spo, cfg, session_id):
+def monitor(spo, cfg, session_id, index):
     by_list = "/_api/web/lists/getbytitle('%s')" % cfg["list_title"]
     poll_s = cfg.get("poll_interval_ms", 2500) / 1000.0
     picked = {}     # item_id -> broker pick time
@@ -322,7 +381,7 @@ def monitor(spo, cfg, session_id):
                  "&$orderby=Turn asc&$top=50") % session_id
             res = spo.raw(q, odata="minimalmetadata")  # minimalmetadata -> per-item odata.etag
             for it in (res.get("json") or {}).get("value", []):
-                handle_detected(spo, by_list, cfg, session_id, it, picked)
+                handle_detected(spo, by_list, cfg, session_id, it, picked, index)
             reap_latency(spo, by_list, session_id, picked, logged)
         except Exception as e:
             log("monitor loop error: %s" % e)
@@ -340,7 +399,12 @@ def main():
     wait_for_auth(spo)
     inject_ui(cdp, spo, cfg, session_id)
     log("UI injected")
-    monitor(spo, cfg, session_id)
+    index = load_index(cfg)
+    if index:
+        log("knowledge index: %d chunks (model=%s)" % (len(index.get("chunks", [])), index.get("model")))
+    else:
+        log("knowledge index: none (plain chat, no RAG)")
+    monitor(spo, cfg, session_id, index)
 
 
 if __name__ == "__main__":

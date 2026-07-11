@@ -5,7 +5,10 @@
   "browser_path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
   "cdp_port": 9222,
   "ollama_endpoint": "http://localhost:11434",
-  "ollama_model": "gemma3:4b",
+  "ollama_model": "qwen2.5:7b",
+  "embed_model": "bge-m3",
+  "top_k": 4,
+  "knowledge_index": "knowledge/index.json",
   "poll_interval_ms": 2500,
   "history_max_turns": 10,
   "system_prompt": "あなたは社内システムマニュアルのQAアシスタントです。簡潔に日本語で回答してください。"

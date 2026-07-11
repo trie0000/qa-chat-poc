@@ -26,6 +26,9 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 | `sharepoint/chat-ui.js` | SPOライブラリへ手動アップロードするブラウザ側UI |
 | `setup/create-list.ps1` | `QA_PoC` リスト作成（PnP.PowerShell）。無い環境向けに手動手順も |
 | `setup/README-PA-flow.md` | Power Automate フロー作成手順（実装対象外・仕様のみ） |
+| `knowledge/manual.md` | 検証用の仮想マニュアル（RAG の知識ソース） |
+| `build_index.py` | manual.md をチャンク化し Ollama で事前ベクトル化 → `knowledge/index.json` |
+| `knowledge/index.json` | 事前計算した埋め込みインデックス（broker が読み込む） |
 | `logs/latency.csv` | 区間別レイテンシの出力先 |
 
 ## SPOリスト `QA_PoC` スキーマ（内部名＝表示名で作成）
@@ -52,7 +55,8 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 4. **設定**: `copy config.example.json config.json` して各値を設定
    （`site_url` / `list_title` / `ui_code_url` / `browser_path` / `ollama_endpoint` / `ollama_model` ...）。
 5. **依存**: `python -m venv .venv` → `.venv\Scripts\pip install websocket-client requests`。
-6. **Ollama**: 対象モデル（既定 `gemma3:4b`）を `ollama pull` 済みにし、サービスを起動。
+6. **Ollama**: 回答用と埋め込み用のモデルを pull（既定 `ollama pull qwen2.5:7b` と `ollama pull bge-m3`）。サービスを起動。
+7. **ナレッジ索引**: `python build_index.py` で `knowledge/manual.md` をチャンク化＋ベクトル化して `knowledge/index.json` を生成（マニュアルを更新したら再実行）。
 
 ## 実行
 
@@ -88,6 +92,25 @@ start.bat をダブルクリック
 > なお Ollama は**初回のみモデルロードのコールドスタート**（数十秒）が乗るので、2ターン目以降で評価する。
 
 ---
+
+## ナレッジ（RAG：マニュアルに基づく回答）
+
+`knowledge/manual.md`（架空の問い合わせ管理システムのマニュアル）を知識ソースとして、
+**質問に関連する箇所だけを検索して回答**します。
+
+- **事前処理**: `build_index.py` が manual.md を `## ` セクション単位でチャンク化し、
+  **Ollama の埋め込みモデル `bge-m3`（多言語・日本語に強い）** でベクトル化 → `knowledge/index.json` に保存。
+- **回答時**: broker が質問を埋め込み → cos 類似で上位 `top_k`(既定4) チャンクを取得 →
+  **回答モデル `qwen2.5:7b`** に「資料をよく読んで答える／無ければ『資料に記載がありません』／出典見出しを示す」指示付きで渡す。
+- **効果（実測）**: 「再オープンは何日以内？→クローズ後7日以内（章10）」等、**根拠つきで正答**。
+  マニュアルに無い質問（例: 経費精算）は **「資料に記載がありません」** と正しく拒否。
+
+**マニュアルを差し替える／増やすとき**: `knowledge/manual.md` を編集 → `python build_index.py` で索引を作り直す → broker 再起動。
+埋め込みモデル/回答モデルは `config.json` の `embed_model` / `ollama_model` で変更可（モデルを変えたら索引の再構築が必要）。
+
+> 補足: pptx 等の別形式を知識にしたい場合も、抽出（例: `python-pptx`）でテキスト化し
+> 同じ `build_index.py` の流れ（チャンク→埋め込み→index.json）に載せれば同様に使えます。
+> 画像内の文字は OCR しない限り取り込めない点に注意。
 
 ## 技術メモ / 制約
 
