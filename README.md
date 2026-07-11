@@ -20,8 +20,9 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 
 | ファイル | 役割 |
 |---|---|
-| `start.bat` | `broker.py` を起動する薄いラッパー（venvがあれば使用 / `chcp 65001`） |
-| `broker.py` | ブラウザ起動・CDP接続・認証待ち・UI注入・監視ループ・Ollama・書き戻し・計測 |
+| `start.bat` | `broker.ps1` を起動する薄いラッパー（`chcp 65001`） |
+| **`broker.ps1`** | **本体（PowerShellのみ・Python不要）**：Edge起動・CDP接続(ClientWebSocket)・認証待ち・リスト自動作成・UI注入・監視ループ・Ollama RAG・書き戻し・計測 |
+| `broker.py` | 上記のPython版（社内API検索モード `corp.py` を含む。ローカルモードは `broker.ps1` で十分） |
 | `config.json` | 設定（`config.example.json` をコピーして作成。gitignore 済） |
 | `sharepoint/chat-ui.js` | SPOライブラリへ手動アップロードするブラウザ側UI |
 | `setup/create-list.ps1` | `QA_PoC` リスト作成（PnP.PowerShell）。無い環境向けに手動手順も |
@@ -52,26 +53,25 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 > **上表の QA_PoC リスト・列と chat-ui.js の SPO 配置は、broker が初回起動時に自動作成**します。
 > 手動のリスト作成/アップロードは不要です（`setup/create-list.ps1` は参考用に残置）。
 
-1. **前提**: Python 3.10+ / git（ローカルAIで動かすなら Ollama も）。
-2. **clone + 依存**:
+> **ローカルOllamaモードは Python 不要**。broker は `broker.ps1`（PowerShell + Windows標準のみ）。
+> Python が要るのは「マニュアルを編集して索引を作り直す（`build_index.py`）」か「社内API検索モード（`broker.py`+`corp.py`）」のときだけ。
+
+1. **前提**: git / 標準Edge（ローカルAIで動かすなら Ollama）。**インストール不要**（PowerShellは同梱）。
+2. **clone**:
    ```
    git clone https://github.com/trie0000/qa-chat-poc
    cd qa-chat-poc
-   python -m venv .venv
-   .venv\Scripts\pip install websocket-client requests
    ```
 3. **設定**: `copy config.example.json config.json` → `site_url` を実 SharePoint サイトに、
    `ui_code_url` を「そのサイト/Shared%20Documents/qa-chat-poc/chat-ui.js」に書き換え
    （`browser_path` は Edge のパス。既定のままで大抵OK）。
-4. **（ローカルAIモードなら）モデル＋索引**:
-   ```
-   ollama pull qwen2.5:7b
-   ollama pull bge-m3
-   python build_index.py
-   ```
-   ※社内API検索モードで使うなら Ollama/索引は不要（起動後に ⚙ で社内API設定）。
+4. **（ローカルAIモードなら）モデル**: `ollama pull qwen2.5:7b` と `ollama pull bge-m3`。
+   ※同梱の `knowledge/index.json` をそのまま使うので**索引の再生成は不要**。マニュアル(`knowledge/manual.md`)を
+     変えたときだけ `python build_index.py` で作り直す（Python必要）。
+   ※社内API検索モードで使うなら Ollama/索引は不要（起動後に ⚙ で社内API設定 → `broker.py` で起動）。
 5. **PAフロー作成**: `setup/README-PA-flow.md`（作成トリガー → `Status=Detected` / `DetectedAt=utcNow()`）。
 6. **起動**: `start.bat`。**初回起動でリスト・列・chat-ui.js を自動生成**し、サインイン後にチャットが立ち上がる。
+   ※`running scripts is disabled` が出たら一度だけ: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
 
 ## 実行
 
