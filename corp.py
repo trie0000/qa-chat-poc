@@ -3,8 +3,8 @@
 # corp.py -- corporate-API search backend (Azure OpenAI compatible, tadori 契約)
 # -----------------------------------------------------------------------------
 # Switches the QA broker's retrieval from local Ollama to the CORPORATE API:
-#   * settings (SPO segments URL + corp API config) come from the browser's
-#     localStorage (qa:* keys set by the settings screen), read via CDP.
+#   * settings (SPO segments URL + corp API config) come from the broker's
+#     config.json ("corp" section). The browser UI holds none of this.
 #   * query embedding via  {base}/openai/deployments/{deploy}/embeddings
 #   * answer via           {base}/openai/deployments/{deploy}/chat/completions
 #     (`base` is the corp gateway directly, or a loopback relay that forwards.)
@@ -32,37 +32,32 @@ def _proxies_for(base):
     #   - remote gateway                 -> go through it (requests honors env HTTP(S)_PROXY)
     host = (urlparse(base).hostname or "").lower()
     return {"http": None, "https": None} if host in ("127.0.0.1", "localhost", "::1") else None
-# Settings come from the ⚙ screen; keys mirror tadori (shared localStorage) + qa:segUrl.
-SETTING_KEYS = ["qa:segUrl", "tadori:ai:corp:base-url", "tadori:ai:corp:deploy-prefix",
-                "tadori:ai:corp:model", "tadori:embedding-model", "tadori:api-version",
-                "tadori:dimensions", "tadori:ai:corp:key"]
 REASONING = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o3", "o4-mini"}   # tadori: reasoning -> preview apiVersion
 
 
-def read_settings(cdp):
-    """Read settings from the browser's localStorage via CDP. Chat and embedding
-    models are separate; the Azure deployment name = prefix + model (dots removed)."""
-    js = "(function(){var o={};" + "".join(
-        "o['%s']=localStorage.getItem('%s');" % (k, k) for k in SETTING_KEYS) + "return JSON.stringify(o);})()"
-    raw = cdp.evaluate(js, False)
-    d = json.loads(raw) if raw else {}
-    prefix = d.get("tadori:ai:corp:deploy-prefix") or ""
-    chat_model = d.get("tadori:ai:corp:model") or ""
-    embed_model = d.get("tadori:embedding-model") or ""
+def read_settings(cfg):
+    """Read corp settings from the broker's config.json (cfg['corp']). The browser
+    UI holds NO API/model config -- it only posts to the list and reads answers.
+    Chat and embedding models are separate; the Azure deployment name =
+    deploy_prefix + model (dots removed)."""
+    c = (cfg or {}).get("corp") or {}
+    prefix = c.get("deploy_prefix") or ""
+    chat_model = c.get("chat_model") or ""
+    embed_model = c.get("embed_model") or ""
     def dep(m):
         return (prefix + m.replace(".", "")) if m else ""
-    dim = d.get("tadori:dimensions") or ""
+    dim = c.get("dimensions")
     return {
-        "seg_url": (d.get("qa:segUrl") or "").rstrip("/"),
-        "base": (d.get("tadori:ai:corp:base-url") or "").rstrip("/"),
+        "seg_url": (c.get("seg_url") or "").rstrip("/"),
+        "base": (c.get("base_url") or "").rstrip("/"),
         "chat_model": chat_model,
         "embed_model": embed_model,
         "chat_deploy": dep(chat_model),
         "embed_deploy": dep(embed_model),
-        "dimensions": int(dim) if dim.isdigit() else None,
-        "embed_api_version": d.get("tadori:api-version") or "2024-02-01",
+        "dimensions": int(dim) if isinstance(dim, (int, float)) and dim else None,
+        "embed_api_version": c.get("embed_api_version") or "2024-02-01",
         "chat_api_version": "2024-12-01-preview" if chat_model in REASONING else "2024-06-01",
-        "api_key": d.get("tadori:ai:corp:key") or "",
+        "api_key": c.get("api_key") or "",
     }
 
 

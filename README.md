@@ -68,7 +68,7 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
 4. **（ローカルAIモードなら）モデル**: `ollama pull qwen2.5:7b` と `ollama pull bge-m3`。
    ※同梱の `knowledge/index.json` をそのまま使うので**索引の再生成は不要**。マニュアル(`knowledge/manual.md`)を
      変えたときだけ `python build_index.py` で作り直す（Python必要）。
-   ※社内API検索モードで使うなら Ollama/索引は不要（起動後に ⚙ で社内API設定 → `broker.py` で起動）。
+   ※社内API検索モードで使うなら Ollama/索引は不要（`config.json` の `corp` を埋めて `broker.py` で起動）。
 5. **PAフロー作成**: `setup/README-PA-flow.md`（作成トリガー → `Status=Detected` / `DetectedAt=utcNow()`）。
 6. **起動**: `start.bat`。**初回起動でリスト・列・chat-ui.js を自動生成**し、サインイン後にチャットが立ち上がる。
    ※`running scripts is disabled` が出たら一度だけ: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
@@ -132,10 +132,11 @@ start.bat をダブルクリック
 ローカル Ollama RAG の代わりに、**社内API（Azure OpenAI互換）で検索・回答**し、
 **Tadori が事前ベクトル化して SPO に置いた文書（セグメント）**を知識源にできます。
 
-- **設定画面**（チャットパネル右上の ⚙）で以下を指定 → localStorage に保存：
-  - **SPO セグメントURL**（ベクトル化済み文書の場所）／社内API ベースURL（ゲートウェイ or リレー loopback）／
-    埋め込みデプロイ名／dimensions／api-version／回答デプロイ名／api-key
-- **broker** はこの設定を **CDP 経由で読み**、設定が揃っていれば **社内API検索モード**に切り替わる（未設定ならローカル Ollama にフォールバック）：
+- **設定は broker 側の `config.json` の `"corp"` セクション**に置く（ブラウザUIには一切持たせない。UIはリストへ質問を出し回答を読むだけ）：
+  - `seg_url`（ベクトル化済み文書=セグメントの SPO URL）／`base_url`（社内API ゲートウェイ or リレー loopback）／
+    `deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`
+  - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
+- **broker.py** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
   1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
   2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み
   3. L2 正規化 cosine で Top-K
@@ -144,7 +145,7 @@ start.bat をダブルクリック
   SPO 認証は既存の bat/CDP で統一。
 
 > ⚠ **未接続検証**：社内API・api-key・実 Tadori セグメントは開発環境から到達できないため、実接続の E2E はここでは未検証。
-> 実装は Tadori の契約（`src/embeddings/client.ts` 等）に厳密準拠し、**リクエスト形式・float16デコード・cosine・設定読込はモックで確認済み**。
+> 実装は Tadori の契約（`src/embeddings/client.ts` 等）に厳密準拠し、**リクエスト形式・float16デコード・cosine・config読込はモックで確認済み**。
 > セグメントのファイル構成（manifest + seg ファイル）は Tadori の想定形式を仮定しているので、実出力が異なる場合は `corp.load_segments()` を調整する。
 
 ## 技術メモ / 制約

@@ -470,8 +470,8 @@ def main():
     inject_ui(cdp, spo, cfg, session_id)
     log("UI injected")
 
-    # Retrieval backend: corp API (if settings screen is configured) else local Ollama index.
-    cs = corp.read_settings(cdp)
+    # Retrieval backend: corp API (if config.json "corp" is filled in) else local Ollama index.
+    cs = corp.read_settings(cfg)
     rag = None
     if corp.enabled(cs):
         try:
