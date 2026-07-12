@@ -172,16 +172,25 @@
     '.qa-ib:hover{background:var(--paper-2);color:var(--ink);}' +
     // main split
     '.qa-main{flex:1;min-height:0;display:flex;}' +
-    '.qa-side{width:264px;flex:0 0 auto;border-right:1px solid var(--line);background:var(--paper-2);display:flex;flex-direction:column;overflow:hidden;}' +
-    '.qa-side-h{padding:12px 14px 8px;font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--ink-4);}' +
-    '.qa-side-list{flex:1;overflow:auto;padding:0 8px 12px;}' +
-    '.qa-sess{padding:9px 10px;border-radius:6px;cursor:pointer;margin-bottom:2px;border:1px solid transparent;}' +
-    '.qa-sess:hover{background:var(--paper-2s);}' +
-    '.qa-sess.sel{background:var(--paper);border-color:var(--line-s);}' +
+    '.qa-side{width:270px;flex:0 0 auto;border-right:1px solid var(--line);background:var(--paper-2);display:flex;flex-direction:column;overflow:hidden;}' +
+    '.qa-side-head{display:flex;align-items:stretch;gap:8px;padding:12px;}' +
+    '.qa-newsess{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:8px 12px;font:inherit;font-size:13px;font-weight:600;color:#fff;background:var(--accent);border:1px solid var(--accent);border-radius:8px;cursor:pointer;}' +
+    '.qa-newsess:hover{background:var(--accent-strong);border-color:var(--accent-strong);}' +
+    '.qa-searchbtn{flex:0 0 auto;width:38px;display:inline-flex;align-items:center;justify-content:center;background:var(--paper-2);border:1px solid var(--line-s);border-radius:8px;color:var(--ink-3);cursor:pointer;}' +
+    '.qa-searchbtn:hover{color:var(--accent-strong);border-color:var(--accent-strong);background:var(--accent-soft);}' +
+    '.qa-search{margin:0 12px 8px;padding:7px 10px;font:inherit;font-size:12px;color:var(--ink);background:var(--paper);border:1px solid var(--line-s);border-radius:7px;outline:none;}' +
+    '.qa-search:focus{border-color:var(--accent);}' +
+    '.qa-side-list{flex:1;min-height:0;overflow-y:auto;padding:0 8px 12px;display:flex;flex-direction:column;gap:2px;}' +
+    '.qa-sess-empty{padding:14px;font-size:12px;color:var(--ink-4);text-align:center;}' +
+    '.qa-sess{display:flex;align-items:flex-start;gap:9px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--ink);}' +
+    '.qa-sess:hover{background:var(--paper-3);}' +
+    '.qa-sess.is-active{background:var(--accent-soft);}' +
+    '.qa-sess-ic{flex:0 0 auto;color:var(--ink-4);display:inline-flex;margin-top:1px;}' +
+    '.qa-sess.is-active .qa-sess-ic{color:var(--accent-strong);}' +
+    '.qa-sess-body{flex:1;min-width:0;}' +
     '.qa-sess-t{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '.qa-sess-m{font-size:11px;color:var(--ink-3);margin-top:3px;display:flex;align-items:center;gap:5px;}' +
-    '.qa-sess-m .live{display:inline-flex;align-items:center;gap:4px;color:var(--ok);}' +
-    '.qa-sess-m .live .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);}' +
+    '.qa-sess.is-active .qa-sess-t{color:var(--accent-strong);font-weight:600;}' +
+    '.qa-sess-m{font-size:11px;color:var(--ink-3);margin-top:2px;}' +
     // content
     '.qa-content{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--paper);}' +
     '.qa-thread{flex:1;min-height:0;overflow:auto;padding:24px 24px 8px;}' +
@@ -231,6 +240,7 @@
     '.qa-hit-head{display:flex;align-items:center;gap:8px;}' +
     '.qa-hit-n{flex:0 0 auto;font-family:var(--mono);font-size:11px;color:var(--accent-strong);background:var(--accent-soft);width:20px;height:20px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;}' +
     '.qa-hit-t{flex:1;min-width:0;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+    'a.qa-hit-link{color:var(--accent-strong);text-decoration:none;}a.qa-hit-link:hover{text-decoration:underline;}' +
     '.qa-hit-k{flex:0 0 auto;font-size:11px;color:var(--ink-3);border:1px solid var(--line);border-radius:99px;padding:1px 8px;}' +
     '.qa-hit-sc{flex:0 0 auto;font-family:var(--mono);font-size:11px;color:var(--accent-strong);background:var(--accent-soft);padding:2px 6px;border-radius:4px;}' +
     '.qa-hit-snip{font-size:12px;color:var(--ink-3);margin-top:5px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}' +
@@ -239,19 +249,27 @@
   var style = document.createElement('style'); style.id = 'qa-style'; style.textContent = css; document.head.appendChild(style);
 
   // ---- DOM skeleton ---------------------------------------------------------
+  var IC_PLUS = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>';
+  var IC_SEARCH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>';
+  var IC_CHAT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7a8.5 8.5 0 1 1 16.1-3.8z"/></svg>';
+
   var root = document.createElement('div'); root.id = ROOT_ID;
   if (localStorage.getItem('qa:theme') === 'dark') { root.dataset.theme = 'dark'; }
   root.innerHTML =
     '<div class="qa-top">' +
       '<div class="qa-brand"><span class="mk">&#21839;</span><span>QA チャット <span class="sub">SharePoint ナレッジ</span></span></div>' +
       '<div class="qa-sp"></div>' +
-      '<span class="qa-chip" title="このブラウザの会話ID"><span class="dot"></span>進行中 <span class="mono qa-sid"></span></span>' +
+      '<span class="qa-chip" title="現在の会話ID"><span class="dot"></span>会話 <span class="mono qa-sid"></span></span>' +
       '<button class="qa-ib qa-theme" title="ダークモード切替">&#9789;</button>' +
       '<button class="qa-ib qa-close" title="閉じる">&#10005;</button>' +
     '</div>' +
     '<div class="qa-main">' +
       '<div class="qa-side">' +
-        '<div class="qa-side-h">セッション履歴</div>' +
+        '<div class="qa-side-head">' +
+          '<button class="qa-newsess" title="新しい会話を開始">' + IC_PLUS + '<span>新しい会話</span></button>' +
+          '<button class="qa-searchbtn" title="会話を検索">' + IC_SEARCH + '</button>' +
+        '</div>' +
+        '<input class="qa-search" type="text" placeholder="会話を検索…" style="display:none">' +
         '<div class="qa-side-list"></div>' +
       '</div>' +
       '<div class="qa-content">' +
@@ -278,6 +296,9 @@
   var hintEl   = root.querySelector('.qa-hint');
   var modelSel = root.querySelector('.qa-model');
   var scopeSel = root.querySelector('.qa-scope');
+  var newsessBtn = root.querySelector('.qa-newsess');
+  var searchBtn = root.querySelector('.qa-searchbtn');
+  var searchInput = root.querySelector('.qa-search');
   root.querySelector('.qa-sid').textContent = String(SID).slice(0, 8);
 
   // model picker (from broker-advertised list); disabled when only one is available
@@ -296,11 +317,24 @@
 
   // ---- state ----------------------------------------------------------------
   var sessMap = {};          // sid -> { id, title, updatedAt, maxId, turns:[item...] }
-  var sessOrder = [];        // sids, recent-first (active pinned to top)
-  var viewSid = SID;         // which session is shown in the thread
+  var sessOrder = [];        // sids, most-recent first
+  var curSid = SID;          // the session you are IN: shown in the thread + where new questions post
+  var searchQ = '';          // sidebar filter text
   var sentAt = {};           // "sid#turn" -> ms the question was posted (response-time base)
   var stamped = {};          // itemId -> DisplayedAt already written
-  var pending = null;        // { turn, q } optimistic in-flight for the active session
+  var pending = null;        // { turn, q } optimistic in-flight for the current session
+
+  function newSessionId() { return 's-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6); }
+  function updateChip() { root.querySelector('.qa-sid').textContent = String(curSid).slice(0, 8); }
+  // keep the current session in the list even before its first question is posted
+  function ensureCur() {
+    if (!sessMap[curSid]) { sessMap[curSid] = { id: curSid, turns: [], maxId: 0, updatedAt: new Date().toISOString(), title: '新しい会話' }; }
+    if (sessOrder.indexOf(curSid) < 0) { sessOrder = [curSid].concat(sessOrder); }
+  }
+  function setCur(sid) {   // switch the session we're in (resume from history / new session)
+    if (!sid || curSid === sid) { return; }
+    curSid = sid; pending = null; updateChip(); ensureCur(); renderSidebar(); renderThread(); input.focus();
+  }
 
   // ---- helpers --------------------------------------------------------------
   function relTime(iso) {
@@ -314,11 +348,17 @@
   function titleOf(s) {
     var q = (s.turns[0] && s.turns[0].Question) ? String(s.turns[0].Question) : '';
     q = q.replace(/\s+/g, ' ').trim();
-    if (!q) { return s.id === SID ? '新しい会話' : '(空のセッション)'; }
+    if (!q) { return '新しい会話'; }
     return q.length > 34 ? q.slice(0, 34) + '…' : q;
   }
+  function matchesSearch(s) {
+    if (!searchQ) { return true; }
+    var q = searchQ.toLowerCase();
+    if (String(s.title || '').toLowerCase().indexOf(q) >= 0) { return true; }
+    return s.turns.some(function (t) { return (String(t.Question || '') + ' ' + String(t.Answer || '')).toLowerCase().indexOf(q) >= 0; });
+  }
   function nextTurn() {
-    var s = sessMap[SID]; var mx = 0;
+    var s = sessMap[curSid]; var mx = 0;
     if (s) { s.turns.forEach(function (t) { if (t.Turn > mx) { mx = t.Turn; } }); }
     if (pending && pending.turn > mx) { mx = pending.turn; }
     return mx + 1;
@@ -343,14 +383,13 @@
       map[sid].turns.sort(function (a, b) { return (a.Turn - b.Turn) || (a.Id - b.Id); });
       map[sid].title = titleOf(map[sid]);
     });
-    if (!map[SID]) { map[SID] = { id: SID, turns: [], maxId: 0, updatedAt: new Date().toISOString(), title: '新しい会話' }; }
-    var order = Object.keys(map).sort(function (a, b) { return map[b].maxId - map[a].maxId; });
-    order = [SID].concat(order.filter(function (x) { return x !== SID; }));   // active pinned to top
-    sessMap = map; sessOrder = order;
+    sessMap = map; sessOrder = Object.keys(map);
+    ensureCur();   // current session present even if it has no server items yet
+    sessOrder.sort(function (a, b) { return String(sessMap[b].updatedAt).localeCompare(String(sessMap[a].updatedAt)); });
     // drop the optimistic bubble once the server reflects that turn
-    if (pending && map[SID].turns.some(function (t) { return t.Turn === pending.turn; })) { pending = null; }
-    // stamp DisplayedAt for freshly shown active-session answers (latency measurement)
-    map[SID].turns.forEach(function (it) {
+    if (pending && sessMap[curSid] && sessMap[curSid].turns.some(function (t) { return t.Turn === pending.turn; })) { pending = null; }
+    // stamp DisplayedAt for freshly shown answers in the current session (latency measurement)
+    (sessMap[curSid] ? sessMap[curSid].turns : []).forEach(function (it) {
       if (classify(it) === 'answered' && !it.DisplayedAt && !stamped[it.Id]) {
         stamped[it.Id] = true;
         rest(BYLIST + '/items(' + it.Id + ')', { method: 'POST', headers: { 'X-HTTP-Method': 'MERGE', 'If-Match': '*' }, body: { DisplayedAt: new Date().toISOString() } }).catch(function () {});
@@ -361,12 +400,18 @@
   }
 
   function renderSidebar() {
-    sideList.innerHTML = sessOrder.map(function (sid) {
+    ensureCur();
+    var shown = sessOrder.filter(function (sid) { return sessMap[sid] && matchesSearch(sessMap[sid]); });
+    if (!shown.length) {
+      sideList.innerHTML = '<div class="qa-sess-empty">' + (searchQ ? '一致する会話がありません' : '会話がありません') + '</div>';
+      return;
+    }
+    sideList.innerHTML = shown.map(function (sid) {
       var s = sessMap[sid];
-      var live = sid === SID ? '<span class="live"><span class="dot"></span>進行中</span>' : relTime(s.updatedAt);
-      return '<div class="qa-sess' + (sid === viewSid ? ' sel' : '') + '" data-sid="' + esc(sid) + '">' +
-        '<div class="qa-sess-t">' + esc(s.title) + '</div>' +
-        '<div class="qa-sess-m"><span>' + s.turns.length + '件</span><span>·</span>' + live + '</div></div>';
+      return '<div class="qa-sess' + (sid === curSid ? ' is-active' : '') + '" data-sid="' + esc(sid) + '">' +
+        '<span class="qa-sess-ic">' + IC_CHAT + '</span>' +
+        '<div class="qa-sess-body"><div class="qa-sess-t">' + esc(s.title) + '</div>' +
+        '<div class="qa-sess-m">' + s.turns.length + '件 · ' + relTime(s.updatedAt) + '</div></div></div>';
     }).join('');
   }
 
@@ -384,9 +429,14 @@
       srcs.map(function (s) {
         var kind = s.kind ? '<span class="qa-hit-k">' + esc(scopeLabel(s.kind)) + '</span>' : '';
         var score = (typeof s.score === 'number') ? '<span class="qa-hit-sc">' + s.score.toFixed(2) + '</span>' : '';
+        var titleTxt = esc(s.title || ('ソース ' + (s.n || '')));
+        // when the source has an original file, make the title a link that opens it in a new tab
+        var title = (s.url && /^https?:\/\//i.test(s.url))
+          ? '<a class="qa-hit-t qa-hit-link" href="' + esc(s.url) + '" target="_blank" rel="noopener noreferrer" title="元のソースを開く">' + titleTxt + ' &#8599;</a>'
+          : '<div class="qa-hit-t">' + titleTxt + '</div>';
         return '<div class="qa-hit" data-body="' + esc(encodeURIComponent(s.body || s.snippet || '')) + '">' +
           '<div class="qa-hit-head"><span class="qa-hit-n">' + (s.n || '') + '</span>' +
-          '<div class="qa-hit-t">' + esc(s.title || ('ソース ' + (s.n || ''))) + '</div>' + kind + score + '</div>' +
+          title + kind + score + '</div>' +
           '<div class="qa-hit-snip">' + esc(s.snippet || '') + '</div></div>';
       }).join('') + '</div></div>';
   }
@@ -400,7 +450,7 @@
     if (it.Status === 'Answered' || it.AnsweredAt || a.trim()) { return 'answered'; }
     return 'pending';
   }
-  function turnHtml(it, isActive) {
+  function turnHtml(it) {
     var ans, extra = '', metaLine = '';
     var cls = classify(it);
     if (cls === 'answered') {
@@ -430,28 +480,25 @@
 
   var lastSig = null;
   function renderThread() {
-    var s = sessMap[viewSid];
-    var isActive = viewSid === SID;
+    ensureCur();
+    var s = sessMap[curSid];
     var turns = s ? s.turns.slice() : [];
-    if (isActive && pending && !turns.some(function (t) { return t.Turn === pending.turn; })) {
-      turns.push({ Id: 'pending', Turn: pending.turn, Question: pending.q, Status: 'Pending', SessionId: SID, Created: null });
+    if (pending && !turns.some(function (t) { return t.Turn === pending.turn; })) {
+      turns.push({ Id: 'pending', Turn: pending.turn, Question: pending.q, Status: 'Pending', SessionId: curSid, Created: null });
     }
-    // composer state is cheap; keep it current even when the thread DOM is reused below
-    input.disabled = !isActive; sendBtn.disabled = !isActive;
-    hintEl.textContent = isActive
-      ? 'Enter で送信 · Shift+Enter で改行 · 回答は Markdown 表示'
-      : '過去のセッション（閲覧のみ）— 新しい質問は進行中の会話へ';
+    // every session is resumable now (the broker answers all sessions), so the composer is always on
+    input.disabled = false; sendBtn.disabled = false;
+    hintEl.textContent = 'Enter で送信 · Shift+Enter で改行 · モデルはいつでも変更可 · 回答は Markdown';
     // skip the rebuild when nothing render-relevant changed, so a user's expanded source card
     // (added to the DOM on click) is not wiped on the next 2.5s poll.
-    var sig = viewSid + '|' + turns.map(function (t) { return t.Id + ':' + classify(t) + ':' + ((t.Answer || '').length) + ':' + ((t.Sources || '').length); }).join(',');
+    var sig = curSid + '|' + turns.map(function (t) { return t.Id + ':' + classify(t) + ':' + ((t.Answer || '').length) + ':' + ((t.Sources || '').length); }).join(',');
     if (sig === lastSig && threadEl.childElementCount) { return; }
     lastSig = sig;
     if (!turns.length) {
-      threadEl.innerHTML = '<div class="qa-empty"><div class="big">&#21839;</div><div>' +
-        (isActive ? '質問を入力して会話を始めましょう。' : 'このセッションには履歴がありません。') + '</div></div>';
+      threadEl.innerHTML = '<div class="qa-empty"><div class="big">&#21839;</div><div>質問を入力して会話を始めましょう。</div></div>';
     } else {
       var atBottom = threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight < 80;
-      threadEl.innerHTML = turns.map(function (it) { return turnHtml(it, isActive); }).join('');
+      threadEl.innerHTML = turns.map(function (it) { return turnHtml(it); }).join('');
       if (atBottom) { threadEl.scrollTop = threadEl.scrollHeight; }
     }
   }
@@ -465,17 +512,17 @@
     }
   }, 1000);
 
-  // ---- send (active session only) -------------------------------------------
+  // ---- send (posts to the current session; broker answers any session) ------
   async function send() {
-    if (viewSid !== SID) { return; }
     var q = input.value.trim(); if (!q) { return; }
     input.value = ''; autosize();
     var t = nextTurn();
-    sentAt[SID + '#' + t] = Date.now();
+    var sid = curSid;
+    sentAt[sid + '#' + t] = Date.now();
     pending = { turn: t, q: q };
     renderThread();
     try {
-      await rest(BYLIST + '/items', { method: 'POST', body: { Title: q.slice(0, 50), Question: q, SessionId: SID, Turn: t, Status: 'Pending', Model: selModel, Scope: selScope } });
+      await rest(BYLIST + '/items', { method: 'POST', body: { Title: q.slice(0, 50), Question: q, SessionId: sid, Turn: t, Status: 'Pending', Model: selModel, Scope: selScope } });
     } catch (e) {
       pending = null; renderThread();
       threadEl.insertAdjacentHTML('beforeend', '<div class="qa-turn"><div class="qa-a"><div class="qa-av">&#21839;</div><div class="qa-ab"><div class="qa-err">送信失敗: ' + esc(e.message) + '</div></div></div></div>');
@@ -489,11 +536,18 @@
   sideList.addEventListener('click', function (e) {
     var card = e.target.closest ? e.target.closest('.qa-sess') : null;
     if (!card) { return; }
-    viewSid = card.getAttribute('data-sid');
-    renderSidebar(); renderThread();
+    setCur(card.getAttribute('data-sid'));   // resume that conversation
   });
+  newsessBtn.addEventListener('click', function () { setCur(newSessionId()); });
+  searchBtn.addEventListener('click', function () {
+    var show = searchInput.style.display === 'none';
+    searchInput.style.display = show ? '' : 'none';
+    if (show) { searchInput.focus(); } else { searchInput.value = ''; searchQ = ''; renderSidebar(); }
+  });
+  searchInput.addEventListener('input', function () { searchQ = searchInput.value.trim(); renderSidebar(); });
   // source cards: collapse the whole block, or expand one card to its full body
   threadEl.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('a')) { return; }   // let a source link open; don't toggle
     var h = e.target.closest ? e.target.closest('.qa-src-h') : null;
     if (h) { h.classList.toggle('collapsed'); if (h.nextElementSibling) { h.nextElementSibling.classList.toggle('collapsed'); } return; }
     var hit = e.target.closest ? e.target.closest('.qa-hit') : null;

@@ -399,31 +399,31 @@ if(!r.ok)throw new Error('HTTP '+r.status+' '+p);return await r.text();})()
   $js = $js.Replace('__WEB__', $webJs).Replace('__PATH__', $pathJs)
   return (Eval-Value $js $true) | ConvertFrom-Json
 }
-# Like Corp-ReadJson but fetches MANY files at once: the browser runs them concurrently via
-# Promise.all (SPO round-trips overlap -- the slow part), so one CDP round-trip returns a
-# whole batch. Returns per-file {ok,status,text} in the SAME order as $paths (Promise.all
-# preserves order), so segment resolution order is unchanged.
-function Corp-ReadJsonBatch($web, $paths) {
+# Fetch MANY files concurrently (browser Promise.all -- the slow SPO round-trips overlap) but do
+# NOT return their bodies in one shot: a batch of segments (each carries base64 embeddings) is
+# several MB and exceeds what Runtime.evaluate returnByValue can hand back (-> null). Instead stash
+# the bodies on window.__qaseg and return only small per-file metadata; the caller pulls each body
+# out singly with Corp-GetBufferItem (one seg always fits). Order matches $paths. This gives the
+# concurrency win without the too-large response AND without the old double-fetch fallback.
+function Corp-FetchBatchToBuffer($web, $paths) {
   $webJs = $web | ConvertTo-Json
   $pathsJs = '[' + (($paths | ForEach-Object { $_ | ConvertTo-Json }) -join ',') + ']'
   $js = @'
 (async()=>{const web=__WEB__;const paths=__PATHS__;
 const out=await Promise.all(paths.map(async p=>{try{
 const u=web+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
-const r=await fetch(u+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
-if(!r.ok)return{ok:false,status:r.status};return{ok:true,text:await r.text()};
-}catch(e){return{ok:false,status:-1,err:String((e&&e.message)||e)};}}));
-return JSON.stringify(out);})()
+const r=await fetch(u+"?_="+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
+if(!r.ok)return{ok:false,status:r.status,text:null};return{ok:true,status:200,text:await r.text()};
+}catch(e){return{ok:false,status:-1,text:null};}}));
+window.__qaseg=out.map(o=>o.text);
+return JSON.stringify(out.map(o=>({ok:o.ok,status:o.status})));})()
 '@
   $js = $js.Replace('__WEB__', $webJs).Replace('__PATHS__', $pathsJs)
-  # Large batches (segments carry base64 embeddings) can exceed what Runtime.evaluate
-  # returnByValue / PS 5.1 ConvertFrom-Json (~2MB) can hand back -> null/throw. Swallow it
-  # and return empty so the caller refetches each file individually (always small enough).
-  try {
-    $val = Eval-Value $js $true
-    if (-not $val) { return @() }
-    return @($val | ConvertFrom-Json)
-  } catch { return @() }
+  try { $v = Eval-Value $js $true; if (-not $v) { return @() }; return @($v | ConvertFrom-Json) } catch { return @() }
+}
+# Pull one stashed segment body (small enough to return) out of the browser buffer.
+function Corp-GetBufferItem($k) {
+  try { return (Eval-Value "(()=>{const t=(window.__qaseg&&window.__qaseg[$k]);return (typeof t==='string')?t:null;})()" $false) } catch { return $null }
 }
 # Single gentle fetch of one file's raw text (used to retry a segment that a concurrent
 # batch dropped to SharePoint throttling). Throws on HTTP error so the caller can back off.
@@ -437,6 +437,41 @@ if(!r.ok)throw new Error('HTTP '+r.status);return await r.text();})()
 '@
   $js = $js.Replace('__WEB__', $webJs).Replace('__PATH__', $pathJs)
   return [string](Eval-Value $js $true)
+}
+# ---- local segment cache: skip refetching every file on restart --------------
+# Keyed by manifest generation+maxSeq+count so a corp-side change auto-invalidates. Stored as TSV
+# with base64 text fields (PS 5.1 ConvertFrom-Json chokes on a multi-MB blob; TSV parses fast and
+# has no size limit). NOTE: this writes corp content (mail/onenote/doc text + embeddings) to local
+# disk in plain form -- it is gitignored; delete knowledge/corp-cache.tsv to purge.
+function Corp-CachePath { return (Join-Path $Here 'knowledge\corp-cache.tsv') }
+function Corp-LoadCache($genKey) {
+  $p = Corp-CachePath
+  if (-not (Test-Path $p)) { return $null }
+  $lines = [IO.File]::ReadAllLines($p, [Text.Encoding]::UTF8)
+  if ($lines.Count -lt 1 -or $lines[0] -ne "gen=$genKey|v2") { return $null }   # missing/stale/old-format
+  $out = New-Object System.Collections.ArrayList
+  for ($i = 1; $i -lt $lines.Count; $i++) {
+    $c = $lines[$i] -split "`t"
+    if ($c.Count -lt 5) { continue }
+    $emb = [CorpF16]::Decode($c[3]); if (-not $emb -or $emb.Count -eq 0) { continue }
+    $url = if ($c.Count -ge 6) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($c[5])) } else { '' }
+    [void]$out.Add([pscustomobject]@{
+      section   = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($c[0]))
+      text      = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($c[4]))
+      embedding = $emb; kind = [string]$c[1]; conv = [string]$c[2]; url = $url })
+  }
+  return $out
+}
+function Corp-WriteCache($genKey, $raw) {
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine("gen=$genKey|v2")
+  foreach ($r in $raw) {
+    $secB = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$r.section))
+    $txtB = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$r.text))
+    $urlB = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$r.url))
+    [void]$sb.AppendLine("$secB`t$([string]$r.kind)`t$([string]$r.conv)`t$([string]$r.emb)`t$txtB`t$urlB")
+  }
+  [IO.File]::WriteAllText((Corp-CachePath), $sb.ToString(), [Text.Encoding]::UTF8)
 }
 # Resolve config.corp.seg_url into { web base, server-relative folder }. Accepts a
 # plain folder URL, a SharePoint sharing/redirect link (https://host/:f:/r/sites/..),
@@ -461,37 +496,56 @@ function Corp-SegLocation {
   $sitePfx = if ($folder -match '^(/(?:sites|teams|personal)/[^/]+)') { $matches[1] } else { '' }
   return [pscustomobject]@{ web = "$origin$sitePfx"; folder = $folder }
 }
+# Best-effort link to the original source file for a segment record. tadori pptx/doc/transcript
+# records carry a *ServerRelUrl (field name varies by kind); mail/onenote may carry a webUrl. Pick
+# the first that looks like a link and make it absolute. Empty when the record has no file (e.g. mail).
+function Record-SourceUrl($r, $origin) {
+  $rel = ''
+  foreach ($p in $r.PSObject.Properties) { if ($p.Name -match 'ServerRelUrl$' -and $p.Value) { $rel = [string]$p.Value; break } }
+  if (-not $rel) { foreach ($p in $r.PSObject.Properties) { if ($p.Name -match '^(webUrl|weburl|url|docPath|path|link)$' -and $p.Value) { $rel = [string]$p.Value; break } } }
+  if (-not $rel) { return '' }
+  if ($rel -like 'http*') { return $rel }
+  return "$origin$rel"
+}
 function Corp-LoadSegments {
   $loc = Corp-SegLocation
   $web = $loc.web; $folder = $loc.folder
+  $origin = "$(([Uri]$web).Scheme)://$(([Uri]$web).Authority)"   # for absolute source links
   Log "corp seg location: web=$web folder=$folder"
   $manifest = Corp-ReadJson $web "$folder/manifest.json"      # { version, generation, maxSeq, sealed[], open, updatedAt }
   if (-not $manifest -or -not (@($manifest.sealed).Count -or $manifest.open)) {
     throw "manifest invalid (no sealed/open): $folder/manifest.json"
   }
+  $genKey = "g$($manifest.generation)-s$($manifest.maxSeq)-n$(@($manifest.sealed).Count)"
+  # cache hit: unchanged corpus -> skip the whole fetch. Auto-invalidates when generation/maxSeq move.
+  try {
+    $cached = Corp-LoadCache $genKey
+    if ($cached -and $cached.Count) { Log "corp cache hit: $($cached.Count) records ($genKey) - skipped fetching $(@($manifest.sealed).Count) segments"; return $cached }
+  } catch { Log "corp cache read failed ($($_.Exception.Message)) - fetching fresh" }
   $ids = @(); if ($manifest.sealed) { $ids += @($manifest.sealed) }
   if ($manifest.open -and $manifest.open.id) { $ids += [string]$manifest.open.id }  # open seg holds newest records
   Log "corp manifest: sealed=$(@($manifest.sealed).Count) open=$(if ($manifest.open) { $manifest.open.id } else { '-' })"
-  # tadori segments are append-only with upsert/delete tombstones; resolve to last-writer-wins
-  # per messageId(+chunkIdx) across segments (sealed in order, then open). Fetch in concurrent
-  # batches (browser Promise.all) to cut startup time; process batches in $ids order to keep
-  # last-writer-wins semantics. seg_fetch_batch tunes concurrency (default 8).
+  # tadori segments are append-only with upsert/delete tombstones; resolve to last-writer-wins per
+  # messageId(+chunkIdx) across segments (sealed in order, then open). Fetch concurrently into a browser
+  # buffer, pull each body out singly (fits returnByValue). Process in $ids order for LWW.
   $total = $ids.Count
-  $batch = if ($Corp.seg_fetch_batch) { [int]$Corp.seg_fetch_batch } else { 4 }   # keep the batch response small enough to return
+  $batch = if ($Corp.seg_fetch_batch) { [int]$Corp.seg_fetch_batch } else { 12 }   # bodies aren't returned in bulk, so go wide
   $map = [ordered]@{}; $mid4key = @{}
   $done = 0; $failed = 0
   for ($i = 0; $i -lt $total; $i += $batch) {
     $hi = [Math]::Min($i + $batch - 1, $total - 1)
     $slice = @($ids[$i..$hi])
     $paths = @($slice | ForEach-Object { "$folder/$($_).json" })
-    $fetched = @(Corp-ReadJsonBatch $web $paths)              # concurrent browser fetch, input order; may be empty
-    # Copy into fixed-length slots so the refetch's index-assign below is in-bounds even when the
-    # batch returned nothing (an empty @() is a fixed-size array; writing past its end would throw).
+    $meta = @(Corp-FetchBatchToBuffer $web $paths)            # concurrent fetch; small metadata back
     $texts = New-Object object[] $slice.Count
-    for ($j = 0; $j -lt $slice.Count; $j++) { if ($j -lt $fetched.Count) { $texts[$j] = $fetched[$j] } }
-    # Refetch any slot the batch did not return (batch response too large to hand back, or a transient
-    # drop) with a single small fetch -- in place, in manifest order, for last-writer-wins. First try is
-    # immediate (covers the too-large case); only back off on an actual failure (throttling).
+    for ($j = 0; $j -lt $slice.Count; $j++) {
+      if ($j -lt $meta.Count -and $meta[$j].ok) {
+        $t = Corp-GetBufferItem $j                            # pull one body from the buffer (fits)
+        if ($t) { $texts[$j] = [pscustomobject]@{ ok = $true; text = [string]$t } }
+      }
+    }
+    # refetch any slot still missing (fetch failure, or a body too big to pull) with a backoff retry --
+    # in place, in manifest order, for last-writer-wins.
     for ($j = 0; $j -lt $slice.Count; $j++) {
       $res = $texts[$j]; if ($res -and $res.ok) { continue }
       for ($try = 1; $try -le 3; $try++) {
@@ -501,7 +555,7 @@ function Corp-LoadSegments {
     }
     for ($j = 0; $j -lt $slice.Count; $j++) {
       $res = $texts[$j]
-      if (-not ($res -and $res.ok)) { $failed++; Log "  seg $($slice[$j]) failed after retry (status=$(if ($res) { $res.status } else { '-' }))"; continue }
+      if (-not ($res -and $res.ok)) { $failed++; Log "  seg $($slice[$j]) failed after retry"; continue }
       $seg = $res.text | ConvertFrom-Json                     # { id, generation, records[] }
       foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
         $mid = [string]$r.messageId
@@ -517,13 +571,20 @@ function Corp-LoadSegments {
     Log "corp segments $done/$total loaded (records so far: $($map.Count))"
   }
   if ($failed) { Log "WARNING: $failed segment(s) failed after retries - some sources missing" }
-  $out = New-Object System.Collections.ArrayList
+  if ($map.Count) { Log ("corp record fields: " + (((@($map.Values)[0]).PSObject.Properties.Name) -join ',')) }  # so we know which URL field exists
+  # build compact records (keep emb base64 for the cache), write the cache, then decode embeddings.
+  $raw = New-Object System.Collections.ArrayList
   foreach ($r in $map.Values) {
     if (-not $r.emb) { continue }                              # emb = base64 Float16 embedding field
+    $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.label) { $r.label } elseif ($r.from) { $r.from } else { [string]$r.kind }
+    [void]$raw.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; kind = [string]$r.kind; conv = [string]$r.conversationId; emb = [string]$r.emb; url = (Record-SourceUrl $r $origin) })
+  }
+  try { Corp-WriteCache $genKey $raw; Log "corp cache written: $($raw.Count) records ($genKey)" } catch { Log "corp cache write failed: $($_.Exception.Message)" }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($r in $raw) {
     $emb = [CorpF16]::Decode([string]$r.emb)
     if (-not $emb -or $emb.Count -eq 0) { continue }
-    $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.label) { $r.label } elseif ($r.from) { $r.from } else { [string]$r.kind }
-    [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb; kind = [string]$r.kind; conv = [string]$r.conversationId })
+    [void]$out.Add([pscustomobject]@{ section = $r.section; text = $r.text; embedding = $emb; kind = $r.kind; conv = $r.conv; url = $r.url })
   }
   return $out
 }
@@ -643,22 +704,22 @@ function Build-SourcesJson($chunks) {
   $n = 0
   $arr = @($chunks | ForEach-Object {
     $n++; $body = [string]$_.text
-    [pscustomobject]@{ n = $n; title = [string]$_.section; snippet = $(if ($body.Length -gt 240) { $body.Substring(0, 240) } else { $body }); body = $body; score = [math]::Round([double]$_.score, 3); kind = [string]$_.kind }
+    [pscustomobject]@{ n = $n; title = [string]$_.section; snippet = $(if ($body.Length -gt 240) { $body.Substring(0, 240) } else { $body }); body = $body; score = [math]::Round([double]$_.score, 3); kind = [string]$_.kind; url = [string]$_.url }
   })
   $j = $arr | ConvertTo-Json -Compress -Depth 5
   if ($arr.Count -eq 1) { $j = '[' + $j + ']' }   # PS unwraps a 1-element array
   return $j
 }
-function Build-Messages($curTurn, $question, $chunks) {
+function Build-Messages($curTurn, $question, $chunks, $sid) {
   $system = $cfg.system_prompt
   if ($chunks.Count) {
     $ctx = ($chunks | ForEach-Object { "[$($_.section)]`n$($_.text)" }) -join "`n`n"
     $system = $system + $cfg.grounding_prompt + $ctx
   }
   $messages = @( @{ role = 'system'; content = $system } )
-  # History keys off AnsweredAt (not Status) so a Power Automate flow that clobbers
-  # Status Answered->Detected cannot erase prior turns from the conversation context.
-  $hq = "$ByList/items?`$select=Turn,Question,Answer,AnsweredAt&`$filter=SessionId eq '$SessionId' and AnsweredAt ne null&`$orderby=Turn asc&`$top=200"
+  # History is scoped to THIS item's session ($sid) so resuming an older conversation keeps its
+  # context. Keys off AnsweredAt (not Status) so a Power Automate clobber can't erase prior turns.
+  $hq = "$ByList/items?`$select=Turn,Question,Answer,AnsweredAt&`$filter=SessionId eq '$sid' and AnsweredAt ne null&`$orderby=Turn asc&`$top=200"
   $rows = @((SpReq $hq).json.value | Where-Object { [int]$_.Turn -lt [int]$curTurn })
   if ($rows.Count -gt $HistMax) { $rows = $rows[($rows.Count - $HistMax)..($rows.Count - 1)] }
   foreach ($r in $rows) {
@@ -686,7 +747,7 @@ function Handle-Detected($it) {
     $scope = [string]$it.Scope
     $chunks = @(Rag-Retrieve ([string]$it.Question) $scope)       # @() : PS unwraps a single-hit return to a scalar
     if ($chunks.Count) { Log ("retrieved $($chunks.Count) sources (scope=$(if ($scope) { $scope } else { 'all' }))") }
-    $messages = Build-Messages $it.Turn ([string]$it.Question) $chunks
+    $messages = Build-Messages $it.Turn ([string]$it.Question) $chunks ([string]$it.SessionId)
     $res = if ($script:Mode -eq 'corp') { Corp-Chat $messages $model } else { Ollama-Chat $messages $model }
     $answer = [string]$res.content
     $costYen = if ($script:Mode -eq 'corp') { ([int]$res.prompt + [int]$res.completion) * (YenPerToken $res.model) } else { 0.0 }
@@ -702,14 +763,14 @@ function Handle-Detected($it) {
 
 $LatHeader = 'SessionId,Turn,CreatedAt,PA_DetectedAt,Broker_PickedAt,AnsweredAt,DisplayedAt'
 function Reap-Latency {
-  $q = "$ByList/items?`$select=Id,Turn,Created,DetectedAt,AnsweredAt,DisplayedAt&`$filter=SessionId eq '$SessionId' and Status eq 'Answered'&`$orderby=Turn asc&`$top=200"
+  $q = "$ByList/items?`$select=Id,Turn,Created,DetectedAt,AnsweredAt,DisplayedAt,SessionId&`$filter=AnsweredAt ne null and DisplayedAt ne null&`$orderby=Id asc&`$top=200"
   foreach ($it in (SpReq $q).json.value) {
     $id = [int]$it.Id
     if ($script:Logged[$id] -or -not $it.DisplayedAt) { continue }
     $dir = Join-Path $Here 'logs'; if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     $file = Join-Path $dir 'latency.csv'
     if (-not (Test-Path $file)) { $LatHeader | Out-File $file -Encoding utf8 }
-    $row = @($SessionId, $it.Turn, $it.Created, $it.DetectedAt, $script:Picked[$id], $it.AnsweredAt, $it.DisplayedAt) -join ','
+    $row = @([string]$it.SessionId, $it.Turn, $it.Created, $it.DetectedAt, $script:Picked[$id], $it.AnsweredAt, $it.DisplayedAt) -join ','
     $row | Out-File $file -Encoding utf8 -Append
     $script:Logged[$id] = $true
   }
@@ -753,7 +814,10 @@ Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
 Log "monitoring list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
 while ($true) {
   try {
-    $q = "$ByList/items?`$select=Id,Turn,Question,Status,Model,Scope&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
+    # Answer EVERY session's UNANSWERED pending items (not just this broker's SID) so the UI can
+    # resume any conversation. "AnsweredAt eq null" skips items a Power Automate flow clobbered from
+    # Answered back to Detected -- without it the broker would re-answer already-answered turns.
+    $q = "$ByList/items?`$select=Id,Turn,Question,Status,Model,Scope,SessionId&`$filter=($StatusFilter) and AnsweredAt eq null&`$orderby=Id asc&`$top=50"
     $items = @((SpReq $q 'GET' $null $null 'minimalmetadata').json.value)
     foreach ($it in $items) {
       if (-not $script:Picked.ContainsKey([int]$it.Id)) {

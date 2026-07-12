@@ -6,3 +6,6 @@ config.json
 
 # measurement output
 logs/*.csv
+
+# local corp segment cache (contains corp content in plaintext -- never commit)
+knowledge/corp-cache.tsv
