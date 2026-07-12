@@ -208,6 +208,10 @@ function Connect-Cdp {
 function Close-ExtraTabs {
   try {
     $pages = @((Invoke-RestMethod "http://127.0.0.1:$Port/json" -TimeoutSec 3) | Where-Object { $_.type -eq 'page' })
+    # Only prune if the tab we actually drive is present. A login redirect can change its target id;
+    # without this guard we'd have no anchor and close EVERY tab, orphaning the CDP connection so the
+    # next SPO fetch fails with "Failed to fetch". If our tab isn't listed, leave all tabs alone.
+    if (-not (@($pages | Where-Object { $_.id -eq $script:CdpTargetId }).Count)) { return }
     $extra = @($pages | Where-Object { $_.id -and $_.id -ne $script:CdpTargetId })
     foreach ($t in $extra) { try { Invoke-RestMethod "http://127.0.0.1:$Port/json/close/$($t.id)" -TimeoutSec 3 | Out-Null } catch {} }
     if ($extra.Count) { Log "closed $($extra.Count) extra tab(s)" }
@@ -861,7 +865,9 @@ $script:Cdp = Connect-Cdp
 Log 'CDP connected'
 Close-ExtraTabs
 Wait-Auth
-Close-ExtraTabs   # again: a policy/startup tab may open a moment after launch
+# NOTE: do NOT prune tabs again here. A fresh-profile login redirect can leave our target id stale,
+# and pruning right after auth was orphaning the CDP -> "Failed to fetch" on the next SPO call.
+try { Log ("driving page: " + (Eval-Value 'location.href.slice(0,90)' $false)) } catch {}
 Ensure-Setup      # idempotent: list + columns + chat-ui.js upload (both roles ensure it exists)
 
 if ($Role -eq 'chat') {
