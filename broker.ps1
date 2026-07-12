@@ -565,6 +565,7 @@ function Reap-Latency {
 
 # ---- main ----
 Log "session $SessionId"
+Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending directly; Power Automate NOT required)' } else { ' (waits for Power Automate to set Pending->Detected)' })"
 Launch-Edge
 $script:Cdp = Connect-Cdp
 Log 'CDP connected'
@@ -595,8 +596,7 @@ if ($script:Mode -ne 'corp') {
 }
 Load-Glossary
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
-Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending directly; Power Automate NOT required)' } else { ' (waits for Power Automate to set Pending->Detected)' })"
-Log "monitoring list '$ListTitle' every $($PollMs)ms (filter: $StatusFilter)"
+Log "monitoring list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
 while ($true) {
   try {
     $q = "$ByList/items?`$select=Id,Turn,Question,Status&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
