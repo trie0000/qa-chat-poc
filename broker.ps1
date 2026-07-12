@@ -595,11 +595,18 @@ if ($script:Mode -ne 'corp') {
 }
 Load-Glossary
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
-Log "monitoring list '$ListTitle' (pickup=$Pickup$(if ($Pickup -eq 'pending') { ' - PA not required' } else { ' - needs Power Automate' }))"
+Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending directly; Power Automate NOT required)' } else { ' (waits for Power Automate to set Pending->Detected)' })"
+Log "monitoring list '$ListTitle' every $($PollMs)ms (filter: $StatusFilter)"
 while ($true) {
   try {
     $q = "$ByList/items?`$select=Id,Turn,Question,Status&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
-    foreach ($it in (SpReq $q 'GET' $null $null 'minimalmetadata').json.value) { Handle-Detected $it }
+    $items = @((SpReq $q 'GET' $null $null 'minimalmetadata').json.value)
+    foreach ($it in $items) {
+      if (-not $script:Picked.ContainsKey([int]$it.Id)) {
+        Log "detected new item $($it.Id) (turn $($it.Turn), status=$($it.Status), qlen=$(([string]$it.Question).Length))"
+      }
+      Handle-Detected $it
+    }
     Reap-Latency
   } catch { Log "monitor error: $($_.Exception.Message)" }
   Start-Sleep -Milliseconds $PollMs
