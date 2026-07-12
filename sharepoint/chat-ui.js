@@ -191,6 +191,9 @@
     '.qa-sess-t{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
     '.qa-sess.is-active .qa-sess-t{color:var(--accent-strong);font-weight:600;}' +
     '.qa-sess-m{font-size:11px;color:var(--ink-3);margin-top:2px;}' +
+    '.qa-sess-del{flex:0 0 auto;display:none;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:none;background:transparent;color:var(--ink-4);border-radius:6px;cursor:pointer;}' +
+    '.qa-sess:hover .qa-sess-del{display:inline-flex;}' +
+    '.qa-sess-del:hover{color:var(--danger);background:var(--danger-soft);}' +
     // content
     '.qa-content{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--paper);}' +
     '.qa-thread{flex:1;min-height:0;overflow:auto;padding:24px 24px 8px;}' +
@@ -252,6 +255,7 @@
   var IC_PLUS = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>';
   var IC_SEARCH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>';
   var IC_CHAT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7a8.5 8.5 0 1 1 16.1-3.8z"/></svg>';
+  var IC_TRASH = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 5v6m4-6v6"/></svg>';
 
   var root = document.createElement('div'); root.id = ROOT_ID;
   if (localStorage.getItem('qa:theme') === 'dark') { root.dataset.theme = 'dark'; }
@@ -335,6 +339,21 @@
     if (!sid || curSid === sid) { return; }
     curSid = sid; pending = null; updateChip(); ensureCur(); renderSidebar(); renderThread(); input.focus();
   }
+  // delete a whole conversation: remove its list items (SharePoint moves them to the site
+  // Recycle Bin, so it's recoverable). If it was the current one, start a fresh session.
+  async function deleteSession(sid) {
+    var s = sessMap[sid];
+    var ids = s ? s.turns.map(function (t) { return t.Id; }).filter(function (id) { return typeof id === 'number'; }) : [];
+    if (ids.length && !window.confirm('この会話を削除しますか？（' + ids.length + '件）\nSharePoint のごみ箱に移動します。')) { return; }
+    for (var i = 0; i < ids.length; i++) {
+      try { await rest(BYLIST + '/items(' + ids[i] + ')', { method: 'POST', headers: { 'X-HTTP-Method': 'DELETE', 'If-Match': '*' } }); } catch (e) {}
+    }
+    delete sessMap[sid];
+    sessOrder = sessOrder.filter(function (x) { return x !== sid; });
+    if (curSid === sid) { curSid = newSessionId(); pending = null; updateChip(); }
+    ensureCur(); lastSig = null; renderSidebar(); renderThread();
+    refresh();
+  }
 
   // ---- helpers --------------------------------------------------------------
   function relTime(iso) {
@@ -411,7 +430,8 @@
       return '<div class="qa-sess' + (sid === curSid ? ' is-active' : '') + '" data-sid="' + esc(sid) + '">' +
         '<span class="qa-sess-ic">' + IC_CHAT + '</span>' +
         '<div class="qa-sess-body"><div class="qa-sess-t">' + esc(s.title) + '</div>' +
-        '<div class="qa-sess-m">' + s.turns.length + '件 · ' + relTime(s.updatedAt) + '</div></div></div>';
+        '<div class="qa-sess-m">' + s.turns.length + '件 · ' + relTime(s.updatedAt) + '</div></div>' +
+        '<button class="qa-sess-del" title="この会話を削除" data-del="' + esc(sid) + '">' + IC_TRASH + '</button></div>';
     }).join('');
   }
 
@@ -534,6 +554,8 @@
 
   // ---- events ---------------------------------------------------------------
   sideList.addEventListener('click', function (e) {
+    var del = e.target.closest ? e.target.closest('.qa-sess-del') : null;
+    if (del) { e.stopPropagation(); deleteSession(del.getAttribute('data-del')); return; }
     var card = e.target.closest ? e.target.closest('.qa-sess') : null;
     if (!card) { return; }
     setCur(card.getAttribute('data-sid'));   // resume that conversation
