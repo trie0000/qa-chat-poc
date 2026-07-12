@@ -9,7 +9,7 @@
   "ollama_endpoint": "http://localhost:11434",
   "ollama_model": "qwen2.5:7b",
   "chat_models": ["qwen2.5:7b", "gemma3:12b"],
-  "_chat_models_note": "チャットのモデル選択ドロップダウンに出す一覧（local。空/未指定なら ollama_model の1つだけ）。corp では corp.chat_models を使う（モデル名を並べる。デプロイ名ではない）。選んだモデルは項目の Model 列で broker に渡り、想定費用の算出にも使う。",
+  "_chat_models_note": "モデル/ソース種別は broker がここ(config)を元に SPO の qa-config.json へ publish し、各 chat はそれを読む（＝利用者に config を配る必要なし。この chat_models/scopes は broker 側の設定）。local はここ(空なら ollama_model の1つ)、corp は corp.chat_models(空なら Tadori の CORP_AI_MODELS 既定)。選んだモデルは項目の Model 列で broker に渡り想定費用にも使う。",
   "embed_model": "bge-m3",
   "top_k": 4,
   "rag_keyword_weight": 0.4,

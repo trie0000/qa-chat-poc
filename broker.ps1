@@ -25,6 +25,7 @@ $cfg = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8) | ConvertFrom-Jso
 $Site       = $cfg.site_url.TrimEnd('/')
 $ListTitle  = $cfg.list_title
 $UiUrl      = $cfg.ui_code_url
+$AppCfgUrl  = $UiUrl -replace '[^/]+$', 'qa-config.json'   # broker publishes models/scopes here; every chat reads it (no per-user config)
 $Port       = if ($Role -eq 'chat') { if ($cfg.chat_cdp_port) { [int]$cfg.chat_cdp_port } else { 9223 } } elseif ($cfg.cdp_port) { [int]$cfg.cdp_port } else { 9222 }
 $Edge       = $cfg.browser_path
 $Ollama     = ($cfg.ollama_endpoint).TrimEnd('/')
@@ -344,13 +345,23 @@ function Inject-UI {
   $src = Eval-Value ("(async()=>{const r=await fetch(encodeURI($($UiUrl | ConvertTo-Json))+'?_='+Date.now()," +
                      "{cache:'no-cache',credentials:'include'});if(!r.ok)throw new Error('ui '+r.status);return await r.text();})()") $true
   Log "UI code fetched: $($src.Length) chars"
-  # advertise the pickable chat models and the source-kind scopes present (raw kinds; the UI
-  # maps them to Japanese labels, since this file is ASCII-only). Requires records loaded first.
-  $models = @(Get-ChatModels)
-  $defModel = if ($script:Mode -eq 'corp') { [string]$Corp.chat_model } else { [string]$ChatModel }
-  # scopes: from loaded records (broker role) or config corp.scopes (chat role has no index loaded)
-  $kinds = if ($Corp.scopes) { @($Corp.scopes | ForEach-Object { [string]$_ }) } elseif (@($script:Records).Count) { @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
-  $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site; mode = $script:Mode; models = $models; defaultModel = $defModel; scopes = $kinds } | ConvertTo-Json -Compress -Depth 5
+  # Models + source scopes come from the app config the BROKER published to SPO (qa-config.json), so
+  # a chat needs no local model/scope config to distribute. Fall back to local computation only if
+  # it hasn't been published yet (raw kinds; the UI maps them to Japanese labels).
+  $app = Read-AppConfig
+  if ($app -and $app.models) {
+    $models = @($app.models | ForEach-Object { [string]$_ })
+    $defModel = [string]$app.defaultModel
+    $kinds = @(@($app.scopes) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $mode = if ($app.mode) { [string]$app.mode } else { $script:Mode }
+    Log "app config from SPO: $($models.Count) models, $($kinds.Count) scopes, mode=$mode"
+  } else {
+    $models = @(Get-ChatModels)
+    $defModel = if ($script:Mode -eq 'corp') { [string]$Corp.chat_model } else { [string]$ChatModel }
+    $kinds = if ($Corp.scopes) { @($Corp.scopes | ForEach-Object { [string]$_ }) } elseif (@($script:Records).Count) { @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
+    $mode = $script:Mode
+  }
+  $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site; mode = $mode; models = $models; defaultModel = $defModel; scopes = $kinds } | ConvertTo-Json -Compress -Depth 5
   Eval-Value ("window.__QA_CONFIG__=$qa;true") $false | Out-Null
   Eval-Value $src $false | Out-Null
   # Re-inject on every new document: SP redirects/SPA navigations after auth would
@@ -364,6 +375,32 @@ function Inject-UI {
     $script:Cdp.Send('Page.addScriptToEvaluateOnNewDocument', (@{ source = $boot } | ConvertTo-Json -Compress)) | Out-Null
   } catch { Log "(reload persistence not set: $($_.Exception.Message))" }
   Log 'UI injected'
+}
+
+# ---- app config in SPO: broker publishes models/scopes/mode; every chat reads it (no per-user config) ----
+function Read-AppConfig {
+  try {
+    # $AppCfgUrl is already %-encoded (derived from ui_code_url); do NOT encodeURI it again or %20
+    # becomes %2520 and SharePoint 404s.
+    $js = "(async()=>{try{const r=await fetch($($AppCfgUrl | ConvertTo-Json)+'?_='+Date.now(),{cache:'no-cache',credentials:'include'});if(!r.ok)return null;return await r.text();}catch(e){return null;}})()"
+    $txt = Eval-Value $js $true
+    if (-not $txt) { return $null }
+    return ($txt | ConvertFrom-Json)
+  } catch { return $null }
+}
+function Write-AppConfig {
+  $models = @(Get-ChatModels)
+  $defModel = if ($script:Mode -eq 'corp') { [string]$Corp.chat_model } else { [string]$ChatModel }
+  $kinds = if ($Corp.scopes) { @($Corp.scopes | ForEach-Object { [string]$_ }) } elseif (@($script:Records).Count) { @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
+  $json = @{ mode = $script:Mode; models = $models; defaultModel = $defModel; scopes = $kinds } | ConvertTo-Json -Compress -Depth 5
+  $json = $json -replace '"scopes":\{\}', '"scopes":[]' -replace '"models":\{\}', '"models":[]'   # PS serializes an empty array as {}
+  $path = [Uri]::UnescapeDataString(([Uri]$UiUrl).AbsolutePath)
+  $folder = $path.Substring(0, $path.LastIndexOf('/'))
+  $d = Get-Digest
+  $up = "$Site/_api/web/GetFolderByServerRelativeUrl('$folder')/Files/add(url='qa-config.json',overwrite=true)"
+  $js = "(async()=>{const r=await fetch(encodeURI($($up | ConvertTo-Json)),{method:'POST',headers:{'X-RequestDigest':$($d | ConvertTo-Json)," +
+        "'Accept':'application/json;odata=nometadata'},credentials:'include',body:$($json | ConvertTo-Json)});return{status:r.status,ok:r.ok};})()"
+  try { $r = Eval-Value $js $true; Log ("app config published to SPO (" + $(if ($r.ok) { 'ok' } else { $r.status }) + "): $(@($models).Count) models, $(@($kinds).Count) scopes") } catch { Log "app config publish failed: $($_.Exception.Message)" }
 }
 
 # ---- Ollama (loopback; WinHTTP bypasses proxy for localhost) ----
@@ -911,6 +948,7 @@ if ($script:Mode -ne 'corp') {
 }
 Rag-BuildIndex
 Load-Glossary
+Write-AppConfig   # publish models/scopes/mode to SPO so chats read them (no per-user config)
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
 Log "broker backend ready (no chat UI here). answering ALL sessions -- list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
 while ($true) {
