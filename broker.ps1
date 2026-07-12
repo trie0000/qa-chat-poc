@@ -775,7 +775,12 @@ function YenPerToken($model) {
 }
 # Chat models the UI may pick from (config-driven; falls back to the single configured model).
 function Get-ChatModels {
-  if ($script:Mode -eq 'corp') { if ($Corp.chat_models) { return @($Corp.chat_models | ForEach-Object { [string]$_ }) }; return @([string]$Corp.chat_model) }
+  if ($script:Mode -eq 'corp') {
+    if ($Corp.chat_models) { return @($Corp.chat_models | ForEach-Object { [string]$_ }) }
+    # default to Tadori's CORP_AI_MODELS list so the picker matches Tadori out of the box (only the
+    # models actually deployed in the tenant will answer; deploy name = deploy_prefix + name).
+    return @('gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini')
+  }
   if ($cfg.chat_models) { return @($cfg.chat_models | ForEach-Object { [string]$_ }) }
   return @([string]$ChatModel)
 }
