@@ -369,6 +369,25 @@ if(!r.ok)throw new Error('HTTP '+r.status+' '+p);return await r.text();})()
   $js = $js.Replace('__WEB__', $webJs).Replace('__PATH__', $pathJs)
   return (Eval-Value $js $true) | ConvertFrom-Json
 }
+# Like Corp-ReadJson but fetches MANY files at once: the browser runs them concurrently via
+# Promise.all (SPO round-trips overlap -- the slow part), so one CDP round-trip returns a
+# whole batch. Returns per-file {ok,status,text} in the SAME order as $paths (Promise.all
+# preserves order), so segment resolution order is unchanged.
+function Corp-ReadJsonBatch($web, $paths) {
+  $webJs = $web | ConvertTo-Json
+  $pathsJs = '[' + (($paths | ForEach-Object { $_ | ConvertTo-Json }) -join ',') + ']'
+  $js = @'
+(async()=>{const web=__WEB__;const paths=__PATHS__;
+const out=await Promise.all(paths.map(async p=>{try{
+const u=web+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
+const r=await fetch(u+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
+if(!r.ok)return{ok:false,status:r.status};return{ok:true,text:await r.text()};
+}catch(e){return{ok:false,status:-1,err:String((e&&e.message)||e)};}}));
+return JSON.stringify(out);})()
+'@
+  $js = $js.Replace('__WEB__', $webJs).Replace('__PATHS__', $pathsJs)
+  return @((Eval-Value $js $true) | ConvertFrom-Json)
+}
 # Resolve config.corp.seg_url into { web base, server-relative folder }. Accepts a
 # plain folder URL, a SharePoint sharing/redirect link (https://host/:f:/r/sites/..),
 # the AllItems.aspx?id=<server-rel> address-bar form, or a server-relative path.
@@ -403,21 +422,37 @@ function Corp-LoadSegments {
   $ids = @(); if ($manifest.sealed) { $ids += @($manifest.sealed) }
   if ($manifest.open -and $manifest.open.id) { $ids += [string]$manifest.open.id }  # open seg holds newest records
   Log "corp manifest: sealed=$(@($manifest.sealed).Count) open=$(if ($manifest.open) { $manifest.open.id } else { '-' })"
-  # tadori segments are append-only with upsert/delete tombstones; resolve to
-  # last-writer-wins per messageId(+chunkIdx) across segments (sealed in order, then open).
+  # tadori segments are append-only with upsert/delete tombstones; resolve to last-writer-wins
+  # per messageId(+chunkIdx) across segments (sealed in order, then open). Fetch in concurrent
+  # batches (browser Promise.all) to cut startup time; process batches in $ids order to keep
+  # last-writer-wins semantics. seg_fetch_batch tunes concurrency (default 8).
+  $total = $ids.Count
+  $batch = if ($Corp.seg_fetch_batch) { [int]$Corp.seg_fetch_batch } else { 8 }
   $map = [ordered]@{}; $mid4key = @{}
-  foreach ($id in $ids) {
-    $seg = Corp-ReadJson $web "$folder/$id.json"              # { id, generation, records[] }
-    foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
-      $mid = [string]$r.messageId
-      if ($r.op -eq 'delete') {                                # tombstone: drop all chunks of this message
-        foreach ($k in @($map.Keys)) { if ($mid4key[$k] -eq $mid) { $map.Remove($k); $mid4key.Remove($k) } }
-        continue
+  $done = 0; $failed = 0
+  for ($i = 0; $i -lt $total; $i += $batch) {
+    $hi = [Math]::Min($i + $batch - 1, $total - 1)
+    $slice = @($ids[$i..$hi])
+    $paths = @($slice | ForEach-Object { "$folder/$($_).json" })
+    $texts = @(Corp-ReadJsonBatch $web $paths)                # concurrent browser fetch, input order
+    for ($j = 0; $j -lt $slice.Count; $j++) {
+      $res = $texts[$j]
+      if (-not ($res -and $res.ok)) { $failed++; Log "  seg $($slice[$j]) failed (status=$(if ($res) { $res.status } else { '-' }))"; continue }
+      $seg = $res.text | ConvertFrom-Json                     # { id, generation, records[] }
+      foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
+        $mid = [string]$r.messageId
+        if ($r.op -eq 'delete') {                              # tombstone: drop all chunks of this message
+          foreach ($k in @($map.Keys)) { if ($mid4key[$k] -eq $mid) { $map.Remove($k); $mid4key.Remove($k) } }
+          continue
+        }
+        $key = "$mid#$($r.chunkIdx)"
+        $map[$key] = $r; $mid4key[$key] = $mid
       }
-      $key = "$mid#$($r.chunkIdx)"
-      $map[$key] = $r; $mid4key[$key] = $mid
     }
+    $done += $slice.Count
+    Log "corp segments $done/$total loaded (records so far: $($map.Count))"
   }
+  if ($failed) { Log "WARNING: $failed segment(s) failed to load" }
   $out = New-Object System.Collections.ArrayList
   foreach ($r in $map.Values) {
     if (-not $r.emb) { continue }                              # emb = base64 Float16 embedding field
