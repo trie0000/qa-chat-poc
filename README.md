@@ -132,7 +132,7 @@ start.bat をダブルクリック
 **Tadori が事前ベクトル化して SPO に置いた文書（セグメント）**を知識源にできます。
 
 - **設定は broker 側の `config.json` の `"corp"` セクション**に置く（ブラウザUIには一切持たせない。UIはリストへ質問を出し回答を読むだけ）：
-  - `seg_url`＝**Tadori のセグメントフォルダ**（既定 `<site>/Shared Documents/Tadori`。`manifest.json` と `seg-NNNNN.json` が置かれている所。フルURLでもサーバ相対でも可。`site_url` と同じサイト前提）／
+  - `seg_url`＝**Tadori のセグメントフォルダ**（既定 `<site>/Shared Documents/Tadori`。`manifest.json` と `seg-NNNNN.json` が置かれている所）。**共有リンク(`https://…/:f:/r/sites/…`)・`AllItems.aspx?id=…`・フォルダURL・サーバ相対のいずれでも可**（自動正規化）。`site_url` と別サイトでも可（同一テナントなら同じCookieで読める）／
     `base_url`（社内API ゲートウェイ）／`deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`／`proxy_url`（任意）
   - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
   - リクエストは `base_url + /openai/deployments/<deploy>/embeddings?api-version=…`（Tadori リレーが受ける形式と同一）。

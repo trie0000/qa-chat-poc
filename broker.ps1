@@ -313,31 +313,49 @@ function Corp-Chat($messages) {
   $url = "$($s.base)/openai/deployments/$($s.chat_deploy)/chat/completions?api-version=$($s.chat_api_version)"
   return (Corp-Http $url @{ messages = $messages }).choices[0].message.content
 }
-# Read a JSON file from SPO exactly like tadori's SharePointClient.readFileText:
-#   {site}/_api/web/GetFileByServerRelativeUrl('<encodeURIComponent(path)>')/$value
+# Read a JSON file from SPO like tadori's SharePointClient.readFileText:
+#   {web}/_api/web/GetFileByServerRelativeUrl('<encodeURIComponent(path)>')/$value
 # (a plain GET of the file's web URL returns the online viewer/redirect, not the bytes).
-function Corp-ReadJson($serverRelPath) {
-  $siteJs = $Site | ConvertTo-Json
+function Corp-ReadJson($web, $serverRelPath) {
+  $webJs = $web | ConvertTo-Json
   $pathJs = $serverRelPath | ConvertTo-Json
   $js = @'
-(async()=>{const site=__SITE__;const p=__PATH__;
-const u=site+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
+(async()=>{const web=__WEB__;const p=__PATH__;
+const u=web+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
 const r=await fetch(u+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
 if(!r.ok)throw new Error('HTTP '+r.status+' '+p);return await r.text();})()
 '@
-  $js = $js.Replace('__SITE__', $siteJs).Replace('__PATH__', $pathJs)
+  $js = $js.Replace('__WEB__', $webJs).Replace('__PATH__', $pathJs)
   return (Eval-Value $js $true) | ConvertFrom-Json
 }
-# seg_url may be a full https folder URL or a server-relative path; return the
-# server-relative Tadori segment folder (tadori layout: <site>/<library>/Tadori).
-function Corp-FolderServerRel {
+# Resolve config.corp.seg_url into { web base, server-relative folder }. Accepts a
+# plain folder URL, a SharePoint sharing/redirect link (https://host/:f:/r/sites/..),
+# the AllItems.aspx?id=<server-rel> address-bar form, or a server-relative path.
+# Segments may live in a different site than site_url (same tenant = same cookies),
+# so the API web base is derived from seg_url itself.
+function Corp-SegLocation {
   $u = [string]$script:CS.seg_url
-  if ($u -like 'http*') { return ([Uri]::UnescapeDataString(([Uri]$u).AbsolutePath)).TrimEnd('/') }
-  return $u.TrimEnd('/')
+  if ($u -notlike 'http*') {
+    $folder = $u.TrimEnd('/')
+    $origin = "$(([Uri]$Site).Scheme)://$(([Uri]$Site).Authority)"
+  } else {
+    $uri = [Uri]$u
+    $origin = "$($uri.Scheme)://$($uri.Authority)"
+    if ($uri.Query -match '[?&]id=([^&]+)') {
+      $folder = ([Uri]::UnescapeDataString($matches[1])).TrimEnd('/')
+    } else {
+      # strip a sharing/redirect prefix like /:f:/r/ or /:w:/s/ down to /sites/...
+      $folder = (([Uri]::UnescapeDataString($uri.AbsolutePath)) -replace '^/:[a-z]:/[a-z]+/', '/').TrimEnd('/')
+    }
+  }
+  $sitePfx = if ($folder -match '^(/(?:sites|teams|personal)/[^/]+)') { $matches[1] } else { '' }
+  return [pscustomobject]@{ web = "$origin$sitePfx"; folder = $folder }
 }
 function Corp-LoadSegments {
-  $folder = Corp-FolderServerRel
-  $manifest = Corp-ReadJson "$folder/manifest.json"           # { version, generation, maxSeq, sealed[], open, updatedAt }
+  $loc = Corp-SegLocation
+  $web = $loc.web; $folder = $loc.folder
+  Log "corp seg location: web=$web folder=$folder"
+  $manifest = Corp-ReadJson $web "$folder/manifest.json"      # { version, generation, maxSeq, sealed[], open, updatedAt }
   if (-not $manifest -or -not (@($manifest.sealed).Count -or $manifest.open)) {
     throw "manifest invalid (no sealed/open): $folder/manifest.json"
   }
@@ -348,7 +366,7 @@ function Corp-LoadSegments {
   # last-writer-wins per messageId(+chunkIdx) across segments (sealed in order, then open).
   $map = [ordered]@{}; $mid4key = @{}
   foreach ($id in $ids) {
-    $seg = Corp-ReadJson "$folder/$id.json"                   # { id, generation, records[] }
+    $seg = Corp-ReadJson $web "$folder/$id.json"              # { id, generation, records[] }
     foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
       $mid = [string]$r.messageId
       if ($r.op -eq 'delete') {                                # tombstone: drop all chunks of this message
