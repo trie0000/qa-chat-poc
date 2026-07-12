@@ -215,6 +215,7 @@
     '.qa-ans .qa-tbl th,.qa-ans .qa-tbl td{border:1px solid var(--line-s);padding:5px 9px;text-align:left;vertical-align:top;}' +
     '.qa-ans .qa-tbl th{background:var(--paper-2s);font-weight:600;}' +
     '.qa-gen{color:var(--ink-3);font-style:italic;}' +
+    '.qa-timeout{color:var(--danger);}' +
     '.qa-err{color:var(--danger);background:var(--danger-soft);padding:8px 10px;border-radius:6px;}' +
     '.qa-meta{margin-top:8px;font-size:12px;color:var(--ink-3);}' +
     '.qa-meta .mono{font-family:var(--mono);}' +
@@ -523,12 +524,21 @@
     }
   }
 
-  // live "生成中 (Ns)" counter for any in-flight bubble
+  // live "生成中 (Ns)" counter. If a question runs far past any real answer time the broker is
+  // likely stopped/killed mid-answer, so give up counting and show a stopped message instead of
+  // spinning forever. (The broker also reclaims orphaned in-flight items on its next start.)
+  var GEN_TIMEOUT = 180;   // seconds
   setInterval(function () {
     var els = root.querySelectorAll('.qa-gen[data-start]');
     for (var k = 0; k < els.length; k++) {
-      var st = +els[k].getAttribute('data-start');
-      els[k].textContent = '回答生成中… (' + Math.max(0, Math.round((Date.now() - st) / 1000)) + 's)';
+      var secs = Math.max(0, Math.round((Date.now() - (+els[k].getAttribute('data-start'))) / 1000));
+      if (secs >= GEN_TIMEOUT) {
+        els[k].removeAttribute('data-start');
+        els[k].classList.remove('qa-gen'); els[k].classList.add('qa-timeout');
+        els[k].textContent = '応答が返りませんでした（broker が停止している可能性）。再送信してください。';
+      } else {
+        els[k].textContent = '回答生成中… (' + secs + 's)';
+      }
     }
   }, 1000);
 

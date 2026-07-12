@@ -40,6 +40,9 @@ $Reasoning  = @('gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini')  # reasoni
 $script:Mode = 'local'   # 'local' (Ollama) | 'corp' (corporate API)
 $script:CS = $null       # resolved corp settings
 $script:Records = @()    # unified searchable records (corp segments or local chunks)
+$script:Mtx = $null      # packed L2-normalized embedding matrix (flat float[N*D]) for compiled cosine
+$script:Dim = 0          # embedding dimension
+$script:DocBi = $null    # per-record char-bigram HashSet[] for compiled keyword coverage
 $script:Glossary = @()   # query-expansion dictionary [{canonical, aliases[]}]
 # hybrid RAG: final = (1-w)*max(0,cosine) + w*bigram-coverage (tadori ragKeywordWeight, default 0.4; 0 = pure vector)
 $RagKwWeight = if ($null -ne $cfg.rag_keyword_weight) { [double]$cfg.rag_keyword_weight } else { 0.4 }
@@ -114,6 +117,50 @@ public static class Rag {
     if (q.Count == 0) return 0.0;
     int hit = 0; foreach (var g in q) if (d.Contains(g)) hit++;
     return (double)hit / q.Count;
+  }
+}
+'@
+
+# Compiled vector engine. PowerShell's per-element loop is ~3000x slower than this: cosine over
+# 15k x 1024 is ~70 s in pure PS vs ~20 ms here. Pack embeddings once (L2-normalized), then each
+# query is a matrix-vector dot; keyword coverage + hybrid combine + ranking are compiled too.
+Add-Type -ReferencedAssemblies 'System.Core' -TypeDefinition @'
+using System; using System.Collections.Generic;
+public static class Vec {
+  // pack N embeddings (jagged, each length d) into one L2-normalized flat float[N*d]
+  public static float[] Pack(double[][] embs, int d) {
+    int n = embs.Length; float[] m = new float[(long)n * d];
+    for (int i = 0; i < n; i++) {
+      double[] e = embs[i]; double ss = 0; for (int j = 0; j < d; j++) ss += e[j] * e[j];
+      double inv = ss > 0 ? 1.0 / Math.Sqrt(ss) : 0.0; int b = i * d;
+      for (int j = 0; j < d; j++) m[b + j] = (float)(e[j] * inv);
+    }
+    return m;
+  }
+  public static float[] Norm(double[] q, int d) {
+    float[] o = new float[d]; double ss = 0; for (int j = 0; j < d; j++) ss += q[j] * q[j];
+    double inv = ss > 0 ? 1.0 / Math.Sqrt(ss) : 0.0; for (int j = 0; j < d; j++) o[j] = (float)(q[j] * inv); return o;
+  }
+  public static double[] Scores(float[] m, float[] q, int n, int d) {   // cosine == dot (both normalized)
+    double[] o = new double[n];
+    for (int i = 0; i < n; i++) { int b = i * d; double s = 0; for (int j = 0; j < d; j++) s += m[b + j] * q[j]; o[i] = s; }
+    return o;
+  }
+  public static double[] CoverageAll(HashSet<string> q, HashSet<string>[] docs) {
+    double[] o = new double[docs.Length]; if (q.Count == 0) return o;
+    for (int i = 0; i < docs.Length; i++) { int hit = 0; var d = docs[i]; foreach (var g in q) if (d.Contains(g)) hit++; o[i] = (double)hit / q.Count; }
+    return o;
+  }
+  public static double[] Combine(double[] cos, double[] cov, double w) {   // hybrid: (1-w)*max(0,cos) + w*coverage
+    int n = cos.Length; double[] o = new double[n];
+    for (int i = 0; i < n; i++) { double c = cos[i]; if (c < 0) c = 0; o[i] = (cov != null) ? ((1 - w) * c + w * cov[i]) : c; }
+    return o;
+  }
+  public static int[] RankIdx(double[] score, byte[] allow) {   // indices sorted by score desc (allow mask optional)
+    int n = score.Length; int m = 0; for (int i = 0; i < n; i++) if (allow == null || allow[i] != 0) m++;
+    int[] idx = new int[m]; double[] sc = new double[m]; int p = 0;
+    for (int i = 0; i < n; i++) { if (allow != null && allow[i] == 0) continue; idx[p] = i; sc[p] = score[i]; p++; }
+    Array.Sort(sc, idx); Array.Reverse(idx); return idx;
   }
 }
 '@
@@ -599,6 +646,21 @@ function Rag-Prep($records) {
   }
   return $records
 }
+# Build the compiled search index once: pack all embeddings into an L2-normalized flat matrix and
+# collect the per-record bigram sets. Packing 15k x 1024 in pure PS would itself take ~70s; C# does
+# it in ~20ms. After this, every query is a compiled matrix-vector dot instead of a PS loop.
+function Rag-BuildIndex {
+  $recs = @($script:Records); $n = $recs.Count
+  if ($n -eq 0) { $script:Mtx = $null; $script:Dim = 0; $script:DocBi = $null; return }
+  $d = @($recs[0].embedding).Count
+  $embs = New-Object 'double[][]' $n
+  $bis  = New-Object 'System.Collections.Generic.HashSet[string][]' $n
+  for ($i = 0; $i -lt $n; $i++) { $embs[$i] = [double[]]$recs[$i].embedding; $bis[$i] = $recs[$i].kwbi }
+  $script:Mtx = [Vec]::Pack($embs, $d)
+  $script:DocBi = $bis
+  $script:Dim = $d
+  Log "search index: $n vectors dim=$d (compiled cosine)"
+}
 # Query expansion: fold glossary synonyms/abbreviations (max 8) into the query
 # (tadori expandQueryTerms). glossary = [{canonical, aliases[]}].
 function Load-Glossary {
@@ -638,46 +700,50 @@ function Extract-Must($question) {
   }
   return @($must)
 }
-function Rag-Walk($sorted, $must, $applyMust) {
+function Rag-Walk($ranked, $combined, $must, $applyMust) {
   $out = New-Object System.Collections.ArrayList; $seenConv = @{}
-  foreach ($e in $sorted) {
-    $r = $e.r
+  $recs = $script:Records
+  foreach ($i in $ranked) {
+    $r = $recs[$i]
     if ($applyMust -and $must.Count) {
       $ok = $true; foreach ($k in $must) { if (-not $r.hay.Contains($k)) { $ok = $false; break } }
       if (-not $ok) { continue }
     }
     if ($r.kind -eq 'onenote' -and $r.conv) { if ($seenConv[$r.conv]) { continue }; $seenConv[$r.conv] = $true }
-    Add-Member -InputObject $r -NotePropertyName score -NotePropertyValue ([double]$e.s) -Force   # carry score for the UI source cards
+    Add-Member -InputObject $r -NotePropertyName score -NotePropertyValue ([double]$combined[$i]) -Force   # carry score for the UI source cards
     [void]$out.Add($r); if ($out.Count -ge $TopK) { break }
   }
   return @($out)
 }
 function Rag-Retrieve($question, $scope) {
-  if (-not $script:Records.Count) { return @() }
+  $n = @($script:Records).Count
+  if ($n -eq 0 -or -not $script:Mtx) { return @() }
   $scopeK = [string]$scope                                                 # '' or 'all' = every source kind
   $extra = Expand-Query $question
   $vecQ = ((([string]$question) + ' ' + ($extra -join ' ')).Trim())
   if ($extra.Count) { Log ("query expanded +[" + ($extra -join ', ') + "]") }
-  $qvec = if ($script:Mode -eq 'corp') { Corp-Embed $vecQ } else { Ollama-Embed $vecQ }
-  $qbi = [Rag]::Bigrams($vecQ)
-  $w = [Math]::Min(1.0, [Math]::Max(0.0, $RagKwWeight))
-  $useKw = ($w -gt 0 -and $qbi.Count -gt 0)
-  $scored = New-Object System.Collections.ArrayList
-  foreach ($r in $script:Records) {
-    if ($scopeK -and $scopeK -ne 'all' -and ([string]$r.kind) -ne $scopeK) { continue }   # source-scope filter
-    if ($r.embedding.Count -ne $qvec.Count) { continue }
-    $vcos = [Math]::Max(0.0, (Cosine $qvec $r.embedding))
-    $s = if ($useKw) { (1 - $w) * $vcos + $w * ([Rag]::Coverage($qbi, $r.kwbi)) } else { $vcos }
-    [void]$scored.Add([pscustomobject]@{ r = $r; s = $s })
-  }
-  if (-not $scored.Count) {
-    Log "WARNING: 0 candidates (query dim=$($qvec.Count), scope=$(if ($scopeK) { $scopeK } else { 'all' })) - check dim/embed_model or scope"
+  $qraw = if ($script:Mode -eq 'corp') { Corp-Embed $vecQ } else { Ollama-Embed $vecQ }
+  $qarr = [double[]]$qraw
+  if ($qarr.Count -ne $script:Dim) {
+    Log "WARNING: query dim=$($qarr.Count) != record dim=$($script:Dim) (align corp.dimensions / embed_model)"
     return @()
   }
-  $sorted = @($scored | Sort-Object s -Descending)
+  $qn = [Vec]::Norm($qarr, $script:Dim)
+  $cos = [Vec]::Scores($script:Mtx, $qn, $n, $script:Dim)                  # compiled bulk cosine (~20ms for 15k)
+  $qbi = [Rag]::Bigrams($vecQ)
+  $w = [Math]::Min(1.0, [Math]::Max(0.0, $RagKwWeight))
+  $cov = if ($w -gt 0 -and $qbi.Count -gt 0) { [Vec]::CoverageAll($qbi, $script:DocBi) } else { $null }
+  $combined = [Vec]::Combine($cos, $cov, $w)                               # compiled hybrid score
+  $allow = $null
+  if ($scopeK -and $scopeK -ne 'all') {                                    # source-scope filter -> allow mask
+    $allow = New-Object 'byte[]' $n
+    for ($i = 0; $i -lt $n; $i++) { if (([string]$script:Records[$i].kind) -eq $scopeK) { $allow[$i] = 1 } }
+  }
+  $ranked = [Vec]::RankIdx($combined, $allow)                             # compiled sort -> record indices desc
+  if (-not $ranked.Length) { return @() }
   $must = Extract-Must $question
-  $pick = @(Rag-Walk $sorted $must $true)                                          # @() : PS unwraps 1-elem returns
-  if ($must.Count -and $pick.Count -eq 0) { $pick = @(Rag-Walk $sorted @() $false) }   # mustContain fallback
+  $pick = @(Rag-Walk $ranked $combined $must $true)                        # @() : PS unwraps 1-elem returns
+  if ($must.Count -and $pick.Count -eq 0) { $pick = @(Rag-Walk $ranked $combined @() $false) }   # mustContain fallback
   return @($pick)
 }
 
@@ -808,6 +874,7 @@ if ($script:Mode -ne 'corp') {
     Log "local Ollama RAG: $($script:Records.Count) chunks (embed=$EmbedModel, chat=$ChatModel)"
   } else { Log 'no knowledge index (plain chat)' }
 }
+Rag-BuildIndex
 Load-Glossary
 Inject-UI
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
@@ -816,8 +883,10 @@ while ($true) {
   try {
     # Answer EVERY session's UNANSWERED pending items (not just this broker's SID) so the UI can
     # resume any conversation. "AnsweredAt eq null" skips items a Power Automate flow clobbered from
-    # Answered back to Detected -- without it the broker would re-answer already-answered turns.
-    $q = "$ByList/items?`$select=Id,Turn,Question,Status,Model,Scope,SessionId&`$filter=($StatusFilter) and AnsweredAt eq null&`$orderby=Id asc&`$top=50"
+    # Answered back to Detected. Also include "Answering": a broker killed mid-answer leaves an item
+    # stuck there (UI spinner runs forever) -- reclaim it so it gets finished; the Picked guard keeps
+    # THIS broker from double-answering its own in-flight items.
+    $q = "$ByList/items?`$select=Id,Turn,Question,Status,Model,Scope,SessionId&`$filter=(($StatusFilter) or Status eq 'Answering') and AnsweredAt eq null&`$orderby=Id asc&`$top=50"
     $items = @((SpReq $q 'GET' $null $null 'minimalmetadata').json.value)
     foreach ($it in $items) {
       if (-not $script:Picked.ContainsKey([int]$it.Id)) {
