@@ -119,6 +119,7 @@ public static class Rag {
 '@
 
 $script:Cdp = $null
+$script:CdpTargetId = $null
 
 function Eval-Value($js, $awaitPromise) {
   $resp = $script:Cdp.Eval($js, $awaitPromise)
@@ -137,7 +138,7 @@ function Connect-Cdp {
       $pages = @($targets | Where-Object { $_.type -eq 'page' -and $_.webSocketDebuggerUrl })
       $pref  = @($pages | Where-Object { $_.url -match 'sharepoint\.com|microsoftonline|/_forms/|login' })
       $pick  = if ($pref.Count) { $pref[0] } elseif ($pages.Count) { $pages[0] } else { $null }
-      if ($pick) { $c = New-Object Cdp; $c.Connect($pick.webSocketDebuggerUrl); return $c }
+      if ($pick) { $script:CdpTargetId = $pick.id; $c = New-Object Cdp; $c.Connect($pick.webSocketDebuggerUrl); return $c }
       $lastErr = "no page target yet"
     } catch { $lastErr = $_.Exception.Message }
     Start-Sleep -Milliseconds 500
@@ -145,6 +146,17 @@ function Connect-Cdp {
   throw ("CDP not reachable on port $Port. last: $lastErr`n" +
          "  Fix: (1) close ALL Edge windows and retry  (2) after failure open http://127.0.0.1:$Port/json/version " +
          "(no JSON = debug port blocked, likely corp Edge policy)  (3) check proxy env for loopback.")
+}
+# Close every page tab except the one the broker drives. Force-killing the profile Edge on
+# restart makes the next launch restore the previous tab, and our command line opens $Site too
+# -> two tabs. Keep the driven target, close the rest, so the UI lives on exactly one tab.
+function Close-ExtraTabs {
+  try {
+    $pages = @((Invoke-RestMethod "http://127.0.0.1:$Port/json" -TimeoutSec 3) | Where-Object { $_.type -eq 'page' })
+    $extra = @($pages | Where-Object { $_.id -and $_.id -ne $script:CdpTargetId })
+    foreach ($t in $extra) { try { Invoke-RestMethod "http://127.0.0.1:$Port/json/close/$($t.id)" -TimeoutSec 3 | Out-Null } catch {} }
+    if ($extra.Count) { Log "closed $($extra.Count) extra tab(s)" }
+  } catch {}
 }
 
 # ---- SPO REST over CDP browser-fetch ----
@@ -203,7 +215,8 @@ function Launch-Edge {
   Log "launching Edge (CDP port $Port, dedicated profile)"
   Start-Process -FilePath $exe -ArgumentList @(
     "--remote-debugging-port=$Port", "--remote-allow-origins=*",
-    "--user-data-dir=$ProfileDir", "--no-first-run", "--no-default-browser-check", $Site) | Out-Null
+    "--user-data-dir=$ProfileDir", "--no-first-run", "--no-default-browser-check",
+    "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", $Site) | Out-Null
 }
 function Wait-Auth {
   Log "Waiting for sign-in. Sign in to SharePoint in the Edge window..."
@@ -403,7 +416,27 @@ if(!r.ok)return{ok:false,status:r.status};return{ok:true,text:await r.text()};
 return JSON.stringify(out);})()
 '@
   $js = $js.Replace('__WEB__', $webJs).Replace('__PATHS__', $pathsJs)
-  return @((Eval-Value $js $true) | ConvertFrom-Json)
+  # Large batches (segments carry base64 embeddings) can exceed what Runtime.evaluate
+  # returnByValue / PS 5.1 ConvertFrom-Json (~2MB) can hand back -> null/throw. Swallow it
+  # and return empty so the caller refetches each file individually (always small enough).
+  try {
+    $val = Eval-Value $js $true
+    if (-not $val) { return @() }
+    return @($val | ConvertFrom-Json)
+  } catch { return @() }
+}
+# Single gentle fetch of one file's raw text (used to retry a segment that a concurrent
+# batch dropped to SharePoint throttling). Throws on HTTP error so the caller can back off.
+function Corp-FetchText($web, $path) {
+  $webJs = $web | ConvertTo-Json; $pathJs = $path | ConvertTo-Json
+  $js = @'
+(async()=>{const web=__WEB__;const p=__PATH__;
+const u=web+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
+const r=await fetch(u+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
+if(!r.ok)throw new Error('HTTP '+r.status);return await r.text();})()
+'@
+  $js = $js.Replace('__WEB__', $webJs).Replace('__PATH__', $pathJs)
+  return [string](Eval-Value $js $true)
 }
 # Resolve config.corp.seg_url into { web base, server-relative folder }. Accepts a
 # plain folder URL, a SharePoint sharing/redirect link (https://host/:f:/r/sites/..),
@@ -444,17 +477,31 @@ function Corp-LoadSegments {
   # batches (browser Promise.all) to cut startup time; process batches in $ids order to keep
   # last-writer-wins semantics. seg_fetch_batch tunes concurrency (default 8).
   $total = $ids.Count
-  $batch = if ($Corp.seg_fetch_batch) { [int]$Corp.seg_fetch_batch } else { 8 }
+  $batch = if ($Corp.seg_fetch_batch) { [int]$Corp.seg_fetch_batch } else { 4 }   # keep the batch response small enough to return
   $map = [ordered]@{}; $mid4key = @{}
   $done = 0; $failed = 0
   for ($i = 0; $i -lt $total; $i += $batch) {
     $hi = [Math]::Min($i + $batch - 1, $total - 1)
     $slice = @($ids[$i..$hi])
     $paths = @($slice | ForEach-Object { "$folder/$($_).json" })
-    $texts = @(Corp-ReadJsonBatch $web $paths)                # concurrent browser fetch, input order
+    $fetched = @(Corp-ReadJsonBatch $web $paths)              # concurrent browser fetch, input order; may be empty
+    # Copy into fixed-length slots so the refetch's index-assign below is in-bounds even when the
+    # batch returned nothing (an empty @() is a fixed-size array; writing past its end would throw).
+    $texts = New-Object object[] $slice.Count
+    for ($j = 0; $j -lt $slice.Count; $j++) { if ($j -lt $fetched.Count) { $texts[$j] = $fetched[$j] } }
+    # Refetch any slot the batch did not return (batch response too large to hand back, or a transient
+    # drop) with a single small fetch -- in place, in manifest order, for last-writer-wins. First try is
+    # immediate (covers the too-large case); only back off on an actual failure (throttling).
+    for ($j = 0; $j -lt $slice.Count; $j++) {
+      $res = $texts[$j]; if ($res -and $res.ok) { continue }
+      for ($try = 1; $try -le 3; $try++) {
+        if ($try -gt 1) { Start-Sleep -Milliseconds (400 * ($try - 1)) }
+        try { $txt = Corp-FetchText $web "$folder/$($slice[$j]).json"; $texts[$j] = [pscustomobject]@{ ok = $true; text = $txt }; break } catch {}
+      }
+    }
     for ($j = 0; $j -lt $slice.Count; $j++) {
       $res = $texts[$j]
-      if (-not ($res -and $res.ok)) { $failed++; Log "  seg $($slice[$j]) failed (status=$(if ($res) { $res.status } else { '-' }))"; continue }
+      if (-not ($res -and $res.ok)) { $failed++; Log "  seg $($slice[$j]) failed after retry (status=$(if ($res) { $res.status } else { '-' }))"; continue }
       $seg = $res.text | ConvertFrom-Json                     # { id, generation, records[] }
       foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
         $mid = [string]$r.messageId
@@ -469,7 +516,7 @@ function Corp-LoadSegments {
     $done += $slice.Count
     Log "corp segments $done/$total loaded (records so far: $($map.Count))"
   }
-  if ($failed) { Log "WARNING: $failed segment(s) failed to load" }
+  if ($failed) { Log "WARNING: $failed segment(s) failed after retries - some sources missing" }
   $out = New-Object System.Collections.ArrayList
   foreach ($r in $map.Values) {
     if (-not $r.emb) { continue }                              # emb = base64 Float16 embedding field
@@ -674,7 +721,9 @@ Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending
 Launch-Edge
 $script:Cdp = Connect-Cdp
 Log 'CDP connected'
+Close-ExtraTabs
 Wait-Auth
+Close-ExtraTabs   # again: a policy/startup tab may open a moment after launch
 Ensure-Setup
 # Retrieval backend loads BEFORE Inject-UI so the UI can advertise available models + source scopes.
 if (Corp-Enabled) {
