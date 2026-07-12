@@ -16,8 +16,10 @@
   var WEB  = String(CFG.webUrl || location.origin).replace(/\/+$/, '');
   var LIST = CFG.listTitle || 'QA_PoC';
   var POLL = CFG.pollIntervalMs || 2500;
-  // session continuity across reloads; broker's id is the seed for a fresh run
-  var SID  = sessionStorage.getItem('qa_sid') || CFG.sessionId;
+  // The broker (re-)injects its current run's sessionId on every load, so it is the
+  // source of truth: a broker restart => new session (matches README). Fall back to
+  // sessionStorage only when the broker didn't inject one (broker not running).
+  var SID  = CFG.sessionId || sessionStorage.getItem('qa_sid');
   sessionStorage.setItem('qa_sid', SID);
 
   var BYLIST = "/_api/web/lists/getbytitle('" + encodeURIComponent(LIST) + "')";
