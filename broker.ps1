@@ -182,9 +182,24 @@ function Sp-Write($rel, $body, $extra = $null, $odata = 'nometadata') {
 }
 
 # ---- browser + auth ----
+function Kill-ProfileEdge {
+  # Kill ONLY msedge processes bound to our dedicated --user-data-dir (.edgeprofile), so a
+  # restart opens the debug port cleanly and mounts the UI with THIS run's SessionId. The
+  # user's normal Edge (default profile) is a separate process tree and is left untouched.
+  # (Window-close does not guarantee the background msedge exits; a lingering one holds the
+  # SingletonLock -> new instance gets absorbed / debug port never opens / stale SID stays.)
+  $stale = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ProfileDir) })
+  if ($stale.Count) {
+    Log "closing $($stale.Count) stale Edge process(es) on the dedicated profile"
+    foreach ($p in $stale) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+    Start-Sleep -Milliseconds 1200   # let the profile SingletonLock release before relaunch
+  }
+}
 function Launch-Edge {
   $exe = $Edge
   if (-not (Test-Path $exe)) { $exe = "C:\Program Files\Microsoft\Edge\Application\msedge.exe" }
+  Kill-ProfileEdge
   Log "launching Edge (CDP port $Port, dedicated profile)"
   Start-Process -FilePath $exe -ArgumentList @(
     "--remote-debugging-port=$Port", "--remote-allow-origins=*",
