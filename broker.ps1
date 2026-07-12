@@ -6,7 +6,13 @@
 #   * polls Detected items and answers them with local Ollama RAG (manual index)
 #     OR the corporate API (Azure OpenAI compatible) when config.json "corp" is set
 # ASCII-only console output; all Japanese text is read from config.json (UTF-8).
+# -----------------------------------------------------------------------------
+# Role: 'broker' (backend: poll the list + RAG + AI answer) or 'chat' (user-facing: open the
+# SharePoint page and inject the chat UI). They run as SEPARATE processes (start-broker.bat /
+# start-chat.bat), each with its own Edge profile + debug port. One broker answers every chat's
+# questions via the list; a chat needs no AI keys and never runs the answer loop.
 # =============================================================================
+param([ValidateSet('broker', 'chat')] [string]$Role = 'broker')
 $ErrorActionPreference = 'Stop'
 # 'sp' is a built-in alias for Set-ItemProperty and would shadow our SpReqfunction.
 Remove-Item Alias:sp -Force -ErrorAction SilentlyContinue
@@ -19,7 +25,7 @@ $cfg = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8) | ConvertFrom-Jso
 $Site       = $cfg.site_url.TrimEnd('/')
 $ListTitle  = $cfg.list_title
 $UiUrl      = $cfg.ui_code_url
-$Port       = if ($cfg.cdp_port) { [int]$cfg.cdp_port } else { 9222 }
+$Port       = if ($Role -eq 'chat') { if ($cfg.chat_cdp_port) { [int]$cfg.chat_cdp_port } else { 9223 } } elseif ($cfg.cdp_port) { [int]$cfg.cdp_port } else { 9222 }
 $Edge       = $cfg.browser_path
 $Ollama     = ($cfg.ollama_endpoint).TrimEnd('/')
 $ChatModel  = $cfg.ollama_model
@@ -32,12 +38,14 @@ $HistMax    = if ($cfg.history_max_turns) { [int]$cfg.history_max_turns } else {
 # accepts Detected so a still-running PA cannot strand a question.
 $Pickup       = if ($cfg.pickup) { ([string]$cfg.pickup).ToLower() } else { 'detected' }
 $StatusFilter = if ($Pickup -eq 'pending') { "(Status eq 'Pending' or Status eq 'Detected')" } else { "Status eq 'Detected'" }
-$ProfileDir = Join-Path $Here '.edgeprofile'
+$ProfileName = if ($Role -eq 'chat') { '.edgeprofile-chat' } else { '.edgeprofile' }
+$ProfileDir = Join-Path $Here $ProfileName
 $SessionId  = [guid]::NewGuid().ToString()
 $ByList     = "/_api/web/lists/getbytitle('$ListTitle')"
 $Corp       = $cfg.corp                                             # corp-API search config (may be $null / empty)
 $Reasoning  = @('gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini')  # reasoning models -> preview api-version
-$script:Mode = 'local'   # 'local' (Ollama) | 'corp' (corporate API)
+# corp when config.corp is filled in; broker re-confirms after actually loading segments.
+$script:Mode = if ($Corp -and $Corp.base_url -and $Corp.api_key -and $Corp.seg_url -and $Corp.embed_model) { 'corp' } else { 'local' }
 $script:CS = $null       # resolved corp settings
 $script:Records = @()    # unified searchable records (corp segments or local chunks)
 $script:Mtx = $null      # packed L2-normalized embedding matrix (flat float[N*D]) for compiled cosine
@@ -247,8 +255,11 @@ function Kill-ProfileEdge {
   # user's normal Edge (default profile) is a separate process tree and is left untouched.
   # (Window-close does not guarantee the background msedge exits; a lingering one holds the
   # SingletonLock -> new instance gets absorbed / debug port never opens / stale SID stays.)
+  # Match the EXACT --user-data-dir flag (bounded), not a substring: '.edgeprofile' is a prefix of
+  # '.edgeprofile-chat', so a plain Contains would make the broker kill the chat's Edge (and vice versa).
+  $pat = [regex]::Escape("--user-data-dir=$ProfileDir") + '(\s|"|$)'
   $stale = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ProfileDir) })
+    Where-Object { $_.CommandLine -and $_.CommandLine -match $pat })
   if ($stale.Count) {
     Log "closing $($stale.Count) stale Edge process(es) on the dedicated profile"
     foreach ($p in $stale) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
@@ -333,7 +344,8 @@ function Inject-UI {
   # maps them to Japanese labels, since this file is ASCII-only). Requires records loaded first.
   $models = @(Get-ChatModels)
   $defModel = if ($script:Mode -eq 'corp') { [string]$Corp.chat_model } else { [string]$ChatModel }
-  $kinds = @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique)
+  # scopes: from loaded records (broker role) or config corp.scopes (chat role has no index loaded)
+  $kinds = if ($Corp.scopes) { @($Corp.scopes | ForEach-Object { [string]$_ }) } elseif (@($script:Records).Count) { @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
   $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site; mode = $script:Mode; models = $models; defaultModel = $defModel; scopes = $kinds } | ConvertTo-Json -Compress -Depth 5
   Eval-Value ("window.__QA_CONFIG__=$qa;true") $false | Out-Null
   Eval-Value $src $false | Out-Null
@@ -843,16 +855,28 @@ function Reap-Latency {
 }
 
 # ---- main ----
-Log "session $SessionId"
-Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending directly; Power Automate NOT required)' } else { ' (waits for Power Automate to set Pending->Detected)' })"
+Log "role: $Role  session $SessionId"
 Launch-Edge
 $script:Cdp = Connect-Cdp
 Log 'CDP connected'
 Close-ExtraTabs
 Wait-Auth
 Close-ExtraTabs   # again: a policy/startup tab may open a moment after launch
-Ensure-Setup
-# Retrieval backend loads BEFORE Inject-UI so the UI can advertise available models + source scopes.
+Ensure-Setup      # idempotent: list + columns + chat-ui.js upload (both roles ensure it exists)
+
+if ($Role -eq 'chat') {
+  # user-facing chat: inject the UI, then idle to keep reload-persistence alive. No index, no AI, no
+  # answer loop -- answers arrive from a separately-running broker (start-broker) via the SPO list.
+  Inject-UI
+  Log 'chat ready. Keep this window open. Answers come from a separately-running broker (start-broker.bat).'
+  while ($true) {
+    Start-Sleep -Seconds 15
+    try { if ((Eval-Value '(!!document.getElementById("qa-root"))' $false) -ne $true) { Inject-UI } } catch {}
+  }
+}
+
+# ---- broker backend: load the retrieval index, then answer ALL sessions (no chat UI here) ----
+Log "pickup mode: $Pickup$(if ($Pickup -eq 'pending') { ' (broker claims Pending directly; Power Automate NOT required)' } else { ' (waits for Power Automate to set Pending->Detected)' })"
 if (Corp-Enabled) {
   $script:CS = Corp-Settings
   try {
@@ -876,9 +900,8 @@ if ($script:Mode -ne 'corp') {
 }
 Rag-BuildIndex
 Load-Glossary
-Inject-UI
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
-Log "monitoring list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
+Log "broker backend ready (no chat UI here). answering ALL sessions -- list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
 while ($true) {
   try {
     # Answer EVERY session's UNANSWERED pending items (not just this broker's SID) so the UI can

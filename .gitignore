@@ -1,8 +1,9 @@
 # local config (contains real SPO site URL -- not committed)
 config.json
 
-# browser profile created by broker
+# browser profiles created by broker / chat
 .edgeprofile/
+.edgeprofile-chat/
 
 # measurement output
 logs/*.csv
