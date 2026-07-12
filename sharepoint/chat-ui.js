@@ -31,9 +31,12 @@
 
   // broker advertises: mode, the chat models you can pick, and the source kinds present.
   var MODE      = CFG.mode || 'local';
-  var MODELS    = [].concat(CFG.models || []).map(String).filter(Boolean);
+  // PS ConvertTo-Json serializes an empty array as {} (an object), not []. Coerce safely so an
+  // empty scopes/models never becomes ["[object Object]"] in the dropdowns.
+  function asArr(v) { return Array.isArray(v) ? v : (v && typeof v === 'object') ? [] : (v || v === 0 ? [v] : []); }
+  var MODELS    = asArr(CFG.models).map(String).filter(Boolean);
   var DEF_MODEL = String(CFG.defaultModel || MODELS[0] || '');
-  var SCOPES    = [].concat(CFG.scopes || []).map(String).filter(Boolean);   // raw kinds; labels below
+  var SCOPES    = asArr(CFG.scopes).map(String).filter(Boolean);   // raw kinds; labels below
   var KIND_LABEL = { mail: 'メール', onenote: 'OneNote', pptx: 'PPTX', transcript: '会議', doc: '文書' };
   function scopeLabel(k) { return KIND_LABEL[k] || k; }
   var selModel = localStorage.getItem('qa:model') || DEF_MODEL;
