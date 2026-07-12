@@ -69,6 +69,7 @@ UIコード(`chat-ui.js`)は SPO ライブラリ上の最新版が常に読ま�
      変えたときだけ `powershell -NoProfile -File build_index.ps1` で作り直す。
    ※社内API検索モードで使うなら Ollama/索引は不要（`config.json` の `corp` を埋めて `start.bat` で起動）。
 5. **PAフロー作成**: `setup/README-PA-flow.md`（作成トリガー → `Status=Detected` / `DetectedAt=utcNow()`）。
+   ※`config.json` の `"pickup":"pending"` にすれば **PA 不要**（下記「拾い上げモード」）。
 6. **起動**: `start.bat`。**初回起動でリスト・列・chat-ui.js を自動生成**し、サインイン後にチャットが立ち上がる。
    ※`running scripts is disabled` が出たら一度だけ: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
 
@@ -84,6 +85,18 @@ start.bat をダブルクリック
 
 > 2回目以降は専用プロファイルにサインインが残るので無操作で進む。
 > broker を止めて再起動しても、ブラウザ／サインイン状態は再利用される。
+
+### 拾い上げモード（`config.json` の `pickup`）
+
+質問アイテムを broker が拾う経路を切り替えられる：
+
+| `pickup` | 経路 | 拾い上げ遅延 | PA |
+|---|---|---|---|
+| `detected`（既定） | PA が `Pending→Detected` にした項目を broker が拾う | PAトリガ遅延（実測6〜29秒）＋ポーリング | **必須** |
+| `pending` | broker が `Pending` を直接拾う（`Pending→Answering` を ETag ロック） | ポーリングのみ（≤`poll_interval_ms`＝既定2.5秒） | **不要** |
+
+- `pending` は速くてシンプル（PAのトリガ遅延が消える）。PoC でPA経路のレイテンシを測る目的なら `detected`。
+- `pending` は `Detected` も同時に拾い、かつ **broker は同一セッションで一度処理した項目を再処理しない**ので、**旧 PA を止め忘れても壊れない**（質問の取りこぼし／二重回答なし）。ただし PA は冗長になるので `pending` 時は停止推奨。
 
 ## 計測の読み方（`logs/latency.csv`）
 

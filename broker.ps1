@@ -27,6 +27,11 @@ $EmbedModel = $cfg.embed_model
 $TopK       = if ($cfg.top_k) { [int]$cfg.top_k } else { 4 }
 $PollMs     = if ($cfg.poll_interval_ms) { [int]$cfg.poll_interval_ms } else { 2500 }
 $HistMax    = if ($cfg.history_max_turns) { [int]$cfg.history_max_turns } else { 10 }
+# pickup mode: 'detected' = broker waits for Power Automate to flip Pending->Detected;
+# 'pending' = broker claims Pending directly (no PA needed, faster). 'pending' also
+# accepts Detected so a still-running PA cannot strand a question.
+$Pickup       = if ($cfg.pickup) { ([string]$cfg.pickup).ToLower() } else { 'detected' }
+$StatusFilter = if ($Pickup -eq 'pending') { "(Status eq 'Pending' or Status eq 'Detected')" } else { "Status eq 'Detected'" }
 $ProfileDir = Join-Path $Here '.edgeprofile'
 $SessionId  = [guid]::NewGuid().ToString()
 $ByList     = "/_api/web/lists/getbytitle('$ListTitle')"
@@ -429,8 +434,11 @@ $script:Picked = @{}
 $script:Logged = @{}
 function Handle-Detected($it) {
   $id = [int]$it.Id
+  if ($script:Picked.ContainsKey($id)) { return }   # already handled this session (guards vs PA re-flipping an answered item)
   $etag = $it.'odata.etag'; if (-not $etag) { $etag = '*' }
-  $claim = Sp-Write "$ByList/items($id)" @{ Status = 'Answering' } @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = $etag }
+  $claimBody = @{ Status = 'Answering' }
+  if ($Pickup -eq 'pending') { $claimBody.DetectedAt = (UtcNow) }   # no PA to stamp DetectedAt in pending mode
+  $claim = Sp-Write "$ByList/items($id)" $claimBody @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = $etag }
   if (-not $claim.ok) { if ($claim.status -ne 412) { Log "claim failed $id : $($claim.status)" }; return }
   $script:Picked[$id] = UtcNow
   Log "picked item $id (turn $($it.Turn))"
@@ -486,10 +494,10 @@ if ($script:Mode -ne 'corp') {
   Load-Index
   if ($script:Index) { Log "local Ollama RAG: $($script:Index.chunks.Count) chunks (embed=$EmbedModel, chat=$ChatModel)" } else { Log 'no knowledge index (plain chat)' }
 }
-Log "monitoring list '$ListTitle' for Detected items"
+Log "monitoring list '$ListTitle' (pickup=$Pickup$(if ($Pickup -eq 'pending') { ' - PA not required' } else { ' - needs Power Automate' }))"
 while ($true) {
   try {
-    $q = "$ByList/items?`$select=Id,Turn,Question,Status&`$filter=SessionId eq '$SessionId' and Status eq 'Detected'&`$orderby=Turn asc&`$top=50"
+    $q = "$ByList/items?`$select=Id,Turn,Question,Status&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
     foreach ($it in (SpReq $q 'GET' $null $null 'minimalmetadata').json.value) { Handle-Detected $it }
     Reap-Latency
   } catch { Log "monitor error: $($_.Exception.Message)" }
