@@ -145,7 +145,7 @@ broker にはどれも当てはまらない（＝リレーの1ホップは不要
 
 | 方式 | `base_url` | `proxy_url` | 社内プロキシの通過 |
 |---|---|---|---|
-| **ゲートウェイ直叩き（既定）** | ゲートウェイの base（例 `https://<resource>.openai.azure.com`） | 社内プロキシURL。システム既定プロキシで足りるなら空 | broker が `Invoke-RestMethod -Proxy`（NTLM等は `-ProxyUseDefaultCredentials`）で通過 |
+| **ゲートウェイ直叩き（既定）** | **tadori の `TADORI_AI_TARGET` と同じ値をそのまま**（例 `https://<resource>.openai.azure.com`。末尾スラッシュ/パス接頭辞は不問） | 社内プロキシURL。システム既定プロキシで足りるなら空 | broker が `Invoke-RestMethod -Proxy`（NTLM等は `-ProxyUseDefaultCredentials`）で通過 |
 | （任意）既存の Tadori リレー流用 | リレーの loopback（例 `http://127.0.0.1:18080`） | 空 | リレーが `TADORI_AI_PROXY` で担う。**すでにリレーを常駐させている場合のみ**の選択肢 |
 
 > `api-key` ヘッダは broker が付与。社内CAの自己署名証明書でTLS検証に失敗する環境だけ別途対応が要る（現状未実装。必要なら追加する）。
