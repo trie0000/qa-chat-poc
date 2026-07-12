@@ -8,6 +8,8 @@
   "ollama_model": "qwen2.5:7b",
   "embed_model": "bge-m3",
   "top_k": 4,
+  "rag_keyword_weight": 0.4,
+  "_rag_note": "ハイブリッド検索の重み。final=(1-w)*cosine + w*文字bigram一致率（Tadori ragKeywordWeight 準拠, 既定0.4）。0=純ベクトル。用語辞書(クエリ展開)は corp: <Tadoriフォルダ>/glossary.json、local: knowledge/glossary.json（[{canonical,aliases[]}]）を置くと有効。質問を「」や\"\"で囲むとその語を必須(mustContain)にできる。",
   "knowledge_index": "knowledge/index.json",
   "poll_interval_ms": 2500,
   "pickup": "detected",

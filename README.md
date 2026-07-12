@@ -132,6 +132,18 @@ start.bat をダブルクリック
 - **効果（実測）**: 「再オープンは何日以内？→クローズ後7日以内（章10）」等、**根拠つきで正答**。
   マニュアルに無い質問（例: 経費精算）は **「資料に記載がありません」** と正しく拒否。
 
+### ハイブリッド検索（Tadori `src/search` 準拠）
+
+ローカル・社内APIどちらのモードでも、純ベクトルではなく **ベクトル＋キーワードのハイブリッド**で並べます。
+
+- **スコア** = `(1-w)*max(0,cosine) + w*文字bigram一致率`。`w`＝`config.json` の `rag_keyword_weight`（既定 **0.4**、`0`で純ベクトル）。日本語は語境界が無いので**文字2-gram**で表記ゆれに強くする。
+- **クエリ展開（用語辞書）**: `glossary.json`（`[{ "canonical": "代表名", "aliases": ["別名","略語"] }]`）を置くと、質問に含まれる語の同義語を**最大8語**、ベクトル側とキーワード側の**両方**に畳み込む。
+  - 置き場所: 社内APIモード=**Tadoriのセグメントと同じフォルダ**（`glossary.json`。Tadori と共用可）／ローカル=`knowledge/glossary.json`。`config.json` の `glossary` に配列を直書きしても可。
+- **mustContain**: 質問中で **`「…」` か `"…"` で囲んだ語は必須**（その語を含む文書だけに絞る）。該当0件なら自動でフォールバック（絞りを外して通常検索）。
+- **重複除去**: OneNote 由来（`kind=onenote`）は同一ページ（conversationId）を1件に集約。
+
+> `rag_keyword_weight=0` にすれば従来どおりの純ベクトル検索に戻せます。`glossary.json` を置かなければクエリ展開は無効（挙動は素のハイブリッド）。
+
 **マニュアルを差し替える／増やすとき**: `knowledge/manual.md` を編集 → `powershell -NoProfile -File build_index.ps1` で索引を作り直す → broker 再起動。
 埋め込みモデル/回答モデルは `config.json` の `embed_model` / `ollama_model` で変更可（モデルを変えたら索引の再構築が必要）。
 

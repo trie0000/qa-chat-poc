@@ -39,7 +39,10 @@ $Corp       = $cfg.corp                                             # corp-API s
 $Reasoning  = @('gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'o3', 'o4-mini')  # reasoning models -> preview api-version
 $script:Mode = 'local'   # 'local' (Ollama) | 'corp' (corporate API)
 $script:CS = $null       # resolved corp settings
-$script:Segments = @()   # corp pre-vectorized documents
+$script:Records = @()    # unified searchable records (corp segments or local chunks)
+$script:Glossary = @()   # query-expansion dictionary [{canonical, aliases[]}]
+# hybrid RAG: final = (1-w)*max(0,cosine) + w*bigram-coverage (tadori ragKeywordWeight, default 0.4; 0 = pure vector)
+$RagKwWeight = if ($null -ne $cfg.rag_keyword_weight) { [double]$cfg.rag_keyword_weight } else { 0.4 }
 
 function Log($m) { Write-Host "[broker] $m" }
 function UtcNow { (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
@@ -92,6 +95,25 @@ public static class CorpF16 {
     byte[] raw = Convert.FromBase64String(b64); int n = raw.Length / 2; double[] o = new double[n];
     for (int i = 0; i < n; i++) { ushort h = (ushort)(raw[i*2] | (raw[i*2+1] << 8)); o[i] = (double)H2F(h); }
     return o;
+  }
+}
+'@
+
+# Char 2-gram keyword index (tadori parity: db.store bigrams/keywordCoverage). Japanese
+# has no word breaks, so hybrid ranking uses char-bigram coverage alongside cosine.
+Add-Type -ReferencedAssemblies 'System.Core' -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Text.RegularExpressions;
+public static class Rag {
+  public static HashSet<string> Bigrams(string text) {
+    string t = Regex.Replace((text ?? "").ToLowerInvariant(), @"\s+", " ").Trim();
+    var set = new HashSet<string>();
+    for (int i = 0; i < t.Length - 1; i++) set.Add(t.Substring(i, 2));
+    return set;
+  }
+  public static double Coverage(HashSet<string> q, HashSet<string> d) {   // |q b d| / |q|
+    if (q.Count == 0) return 0.0;
+    int hit = 0; foreach (var g in q) if (d.Contains(g)) hit++;
+    return (double)hit / q.Count;
   }
 }
 '@
@@ -268,12 +290,7 @@ function Cosine($a, $b) {
   if ($na -eq 0 -or $nb -eq 0) { return 0.0 }
   return $dot / ([Math]::Sqrt($na) * [Math]::Sqrt($nb))
 }
-function Retrieve($question) {
-  if (-not $script:Index) { return @() }
-  $q = Ollama-Embed $question
-  $scored = foreach ($c in $script:Index.chunks) { [pscustomobject]@{ score = (Cosine $q $c.embedding); c = $c } }
-  return @($scored | Sort-Object score -Descending | Select-Object -First $TopK | ForEach-Object { $_.c })
-}
+# retrieval is unified in the hybrid RAG section (Rag-Retrieve), used by both modes.
 
 # ---- corp-API search (Azure OpenAI compatible; tadori segments in SPO) --------
 # Config lives in config.json "corp"; the browser UI holds none of it. Azure
@@ -392,26 +409,103 @@ function Corp-LoadSegments {
     $emb = [CorpF16]::Decode([string]$r.emb)
     if (-not $emb -or $emb.Count -eq 0) { continue }
     $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.label) { $r.label } elseif ($r.from) { $r.from } else { [string]$r.kind }
-    [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb })
+    [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb; kind = [string]$r.kind; conv = [string]$r.conversationId })
   }
   return $out
 }
-function Corp-Search($question) {
-  $q = Corp-Embed $question
-  $scored = foreach ($seg in $script:Segments) {
-    if ($seg.embedding.Count -ne $q.Count) { continue }
-    [pscustomobject]@{ score = (Cosine $q $seg.embedding); c = $seg }
+# ---- hybrid RAG: vector cosine + char-bigram keyword coverage + glossary query
+#      expansion + mustContain + onenote dedup (tadori src/search parity) -----------
+# Attach a char-bigram index (kwbi) and a mustContain haystack (hay) to each record.
+function Rag-Prep($records) {
+  foreach ($r in $records) {
+    $src = ("{0} {1}" -f [string]$r.section, [string]$r.text)
+    Add-Member -InputObject $r -NotePropertyName kwbi -NotePropertyValue ([Rag]::Bigrams($src)) -Force
+    Add-Member -InputObject $r -NotePropertyName hay  -NotePropertyValue ($src.ToLowerInvariant()) -Force
   }
-  $scored = @($scored)
-  if ($script:Segments.Count -and -not $scored.Count) {
-    Log "WARNING: query dim=$($q.Count) != segment dim=$(@($script:Segments[0].embedding).Count) (align corp.dimensions / embed_model)"
+  return $records
+}
+# Query expansion: fold glossary synonyms/abbreviations (max 8) into the query
+# (tadori expandQueryTerms). glossary = [{canonical, aliases[]}].
+function Load-Glossary {
+  $g = @()
+  if ($cfg.glossary) { $g = @($cfg.glossary) }
+  elseif ($script:Mode -eq 'corp') {
+    try { $loc = Corp-SegLocation; $g = @(Corp-ReadJson $loc.web "$($loc.folder)/glossary.json") } catch { $g = @() }
+  } else {
+    $gp = Join-Path $Here 'knowledge\glossary.json'
+    if (Test-Path $gp) { try { $g = @([IO.File]::ReadAllText($gp, [Text.Encoding]::UTF8) | ConvertFrom-Json) } catch { $g = @() } }
   }
-  return @($scored | Sort-Object score -Descending | Select-Object -First $TopK | ForEach-Object { $_.c })
+  $script:Glossary = @($g | Where-Object { $_ -and ($_.canonical -or $_.aliases) })
+  if ($script:Glossary.Count) { Log "glossary: $($script:Glossary.Count) entries" }
+}
+function Expand-Query($query) {
+  $q = ([string]$query).ToLowerInvariant().Trim()
+  if (-not $q -or -not $script:Glossary.Count) { return @() }
+  $added = New-Object System.Collections.Generic.List[string]
+  foreach ($e in $script:Glossary) {
+    $group = @(); if ($e.canonical) { $group += [string]$e.canonical }; if ($e.aliases) { $group += @($e.aliases | ForEach-Object { [string]$_ }) }
+    $group = @($group | Where-Object { $_ -and $_.Length -ge 2 })
+    $hit = $false; foreach ($f in $group) { if ($q.Contains($f.ToLowerInvariant())) { $hit = $true; break } }
+    if (-not $hit) { continue }
+    foreach ($f in $group) {
+      if ($q.Contains($f.ToLowerInvariant()) -or $added.Contains($f)) { continue }
+      $added.Add($f); if ($added.Count -ge 8) { return @($added) }
+    }
+  }
+  return @($added)
+}
+# mustContain: terms the user quoted with japanese or ascii quotes must appear verbatim.
+function Extract-Must($question) {
+  $must = New-Object System.Collections.Generic.List[string]
+  $o = [char]0x300C; $c = [char]0x300D   # Japanese corner brackets, built from code points to keep this file ASCII-only
+  foreach ($pat in @("$o([^$c]{2,})$c", '"([^"]{2,})"')) {
+    foreach ($m in [regex]::Matches([string]$question, $pat)) { [void]$must.Add($m.Groups[1].Value.ToLowerInvariant()) }
+  }
+  return @($must)
+}
+function Rag-Walk($sorted, $must, $applyMust) {
+  $out = New-Object System.Collections.ArrayList; $seenConv = @{}
+  foreach ($e in $sorted) {
+    $r = $e.r
+    if ($applyMust -and $must.Count) {
+      $ok = $true; foreach ($k in $must) { if (-not $r.hay.Contains($k)) { $ok = $false; break } }
+      if (-not $ok) { continue }
+    }
+    if ($r.kind -eq 'onenote' -and $r.conv) { if ($seenConv[$r.conv]) { continue }; $seenConv[$r.conv] = $true }
+    [void]$out.Add($r); if ($out.Count -ge $TopK) { break }
+  }
+  return @($out)
+}
+function Rag-Retrieve($question) {
+  if (-not $script:Records.Count) { return @() }
+  $extra = Expand-Query $question
+  $vecQ = ((([string]$question) + ' ' + ($extra -join ' ')).Trim())
+  if ($extra.Count) { Log ("query expanded +[" + ($extra -join ', ') + "]") }
+  $qvec = if ($script:Mode -eq 'corp') { Corp-Embed $vecQ } else { Ollama-Embed $vecQ }
+  $qbi = [Rag]::Bigrams($vecQ)
+  $w = [Math]::Min(1.0, [Math]::Max(0.0, $RagKwWeight))
+  $useKw = ($w -gt 0 -and $qbi.Count -gt 0)
+  $scored = New-Object System.Collections.ArrayList
+  foreach ($r in $script:Records) {
+    if ($r.embedding.Count -ne $qvec.Count) { continue }
+    $vcos = [Math]::Max(0.0, (Cosine $qvec $r.embedding))
+    $s = if ($useKw) { (1 - $w) * $vcos + $w * ([Rag]::Coverage($qbi, $r.kwbi)) } else { $vcos }
+    [void]$scored.Add([pscustomobject]@{ r = $r; s = $s })
+  }
+  if (-not $scored.Count) {
+    Log "WARNING: query dim=$($qvec.Count) != record dim=$(@($script:Records[0].embedding).Count) (align corp.dimensions / embed_model)"
+    return @()
+  }
+  $sorted = @($scored | Sort-Object s -Descending)
+  $must = Extract-Must $question
+  $pick = @(Rag-Walk $sorted $must $true)                                          # @() : PS unwraps 1-elem returns
+  if ($must.Count -and $pick.Count -eq 0) { $pick = @(Rag-Walk $sorted @() $false) }   # mustContain fallback
+  return @($pick)
 }
 
 # ---- answer a Detected item ----
 function Build-Messages($curTurn, $question) {
-  $chunks = if ($script:Mode -eq 'corp') { Corp-Search $question } else { Retrieve $question }
+  $chunks = @(Rag-Retrieve $question)   # @() : PS unwraps a single-hit return to a scalar otherwise
   if ($chunks.Count) { Log ("retrieved: " + (($chunks | ForEach-Object { $_.section }) -join ', ')) }
   $system = $cfg.system_prompt
   if ($chunks.Count) {
@@ -481,19 +575,26 @@ Inject-UI
 if (Corp-Enabled) {
   $script:CS = Corp-Settings
   try {
-    $script:Segments = Corp-LoadSegments
     $script:Mode = 'corp'
-    $segDim = if ($script:Segments.Count) { @($script:Segments[0].embedding).Count } else { 0 }
-    Log "corp search ON: $($script:Segments.Count) records dim=$segDim (base=$($script:CS.base) embed=$($script:CS.embed_deploy) chat=$($script:CS.chat_deploy))"
-    if ($script:Segments.Count -eq 0) { Log "WARNING: 0 records loaded - check seg_url points at the Tadori folder (<site>/Shared Documents/Tadori)" }
+    $script:Records = @(Rag-Prep (Corp-LoadSegments))
+    $segDim = if ($script:Records.Count) { @($script:Records[0].embedding).Count } else { 0 }
+    Log "corp search ON: $($script:Records.Count) records dim=$segDim (base=$($script:CS.base) embed=$($script:CS.embed_deploy) chat=$($script:CS.chat_deploy))"
+    if ($script:Records.Count -eq 0) { Log "WARNING: 0 records loaded - check seg_url points at the Tadori folder (<site>/Shared Documents/Tadori)" }
   } catch {
+    $script:Mode = 'local'
     Log "corp segments load failed ($($_.Exception.Message)) -> falling back to local Ollama"
   }
 }
 if ($script:Mode -ne 'corp') {
   Load-Index
-  if ($script:Index) { Log "local Ollama RAG: $($script:Index.chunks.Count) chunks (embed=$EmbedModel, chat=$ChatModel)" } else { Log 'no knowledge index (plain chat)' }
+  if ($script:Index) {
+    $script:Records = @(Rag-Prep (@($script:Index.chunks | ForEach-Object {
+      [pscustomobject]@{ section = [string]$_.section; text = [string]$_.text; embedding = $_.embedding; kind = ''; conv = '' } })))
+    Log "local Ollama RAG: $($script:Records.Count) chunks (embed=$EmbedModel, chat=$ChatModel)"
+  } else { Log 'no knowledge index (plain chat)' }
 }
+Load-Glossary
+Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
 Log "monitoring list '$ListTitle' (pickup=$Pickup$(if ($Pickup -eq 'pending') { ' - PA not required' } else { ' - needs Power Automate' }))"
 while ($true) {
   try {
