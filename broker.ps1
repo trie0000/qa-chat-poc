@@ -313,28 +313,59 @@ function Corp-Chat($messages) {
   $url = "$($s.base)/openai/deployments/$($s.chat_deploy)/chat/completions?api-version=$($s.chat_api_version)"
   return (Corp-Http $url @{ messages = $messages }).choices[0].message.content
 }
-function Sp-FetchJson($absUrl) {   # fetch an ABSOLUTE SPO url via the browser session (cache-busted)
-  $u = $absUrl | ConvertTo-Json
-  $js = "(async()=>{const u=$u;const r=await fetch(encodeURI(u)+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now()," +
-        "{credentials:'include',cache:'no-cache'});if(!r.ok)throw new Error('HTTP '+r.status);return await r.text();})()"
+# Read a JSON file from SPO exactly like tadori's SharePointClient.readFileText:
+#   {site}/_api/web/GetFileByServerRelativeUrl('<encodeURIComponent(path)>')/$value
+# (a plain GET of the file's web URL returns the online viewer/redirect, not the bytes).
+function Corp-ReadJson($serverRelPath) {
+  $siteJs = $Site | ConvertTo-Json
+  $pathJs = $serverRelPath | ConvertTo-Json
+  $js = @'
+(async()=>{const site=__SITE__;const p=__PATH__;
+const u=site+"/_api/web/GetFileByServerRelativeUrl('"+encodeURIComponent(p)+"')/$value";
+const r=await fetch(u+(u.indexOf('?')>=0?'&':'?')+'_='+Date.now(),{credentials:'include',cache:'no-cache',headers:{Accept:'application/json;odata=nometadata'}});
+if(!r.ok)throw new Error('HTTP '+r.status+' '+p);return await r.text();})()
+'@
+  $js = $js.Replace('__SITE__', $siteJs).Replace('__PATH__', $pathJs)
   return (Eval-Value $js $true) | ConvertFrom-Json
 }
+# seg_url may be a full https folder URL or a server-relative path; return the
+# server-relative Tadori segment folder (tadori layout: <site>/<library>/Tadori).
+function Corp-FolderServerRel {
+  $u = [string]$script:CS.seg_url
+  if ($u -like 'http*') { return ([Uri]::UnescapeDataString(([Uri]$u).AbsolutePath)).TrimEnd('/') }
+  return $u.TrimEnd('/')
+}
 function Corp-LoadSegments {
-  $s = $script:CS
-  $manifest = Sp-FetchJson "$($s.seg_url)/manifest.json"
-  $files = $manifest.files; if (-not $files) { $files = $manifest.segments }; if (-not $files) { $files = $manifest.seg }
-  $out = New-Object System.Collections.ArrayList
-  foreach ($f in @($files)) {
-    $u = if ([string]$f -like 'http*') { [string]$f } else { "$($s.seg_url)/$f" }
-    $seg = Sp-FetchJson $u
-    $recs = if ($seg -is [array]) { $seg } elseif ($seg.records) { $seg.records } else { @($seg) }
-    foreach ($r in $recs) {
-      $emb = $r.embedding
-      if ($emb -is [string]) { $emb = [CorpF16]::Decode($emb) }
-      if (-not $emb) { continue }
-      $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.from) { $r.from } else { '' }
-      [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb })
+  $folder = Corp-FolderServerRel
+  $manifest = Corp-ReadJson "$folder/manifest.json"           # { version, generation, maxSeq, sealed[], open, updatedAt }
+  if (-not $manifest -or -not (@($manifest.sealed).Count -or $manifest.open)) {
+    throw "manifest invalid (no sealed/open): $folder/manifest.json"
+  }
+  $ids = @(); if ($manifest.sealed) { $ids += @($manifest.sealed) }
+  if ($manifest.open -and $manifest.open.id) { $ids += [string]$manifest.open.id }  # open seg holds newest records
+  Log "corp manifest: sealed=$(@($manifest.sealed).Count) open=$(if ($manifest.open) { $manifest.open.id } else { '-' })"
+  # tadori segments are append-only with upsert/delete tombstones; resolve to
+  # last-writer-wins per messageId(+chunkIdx) across segments (sealed in order, then open).
+  $map = [ordered]@{}; $mid4key = @{}
+  foreach ($id in $ids) {
+    $seg = Corp-ReadJson "$folder/$id.json"                   # { id, generation, records[] }
+    foreach ($r in (@($seg.records) | Sort-Object { [int]$_.seq })) {
+      $mid = [string]$r.messageId
+      if ($r.op -eq 'delete') {                                # tombstone: drop all chunks of this message
+        foreach ($k in @($map.Keys)) { if ($mid4key[$k] -eq $mid) { $map.Remove($k); $mid4key.Remove($k) } }
+        continue
+      }
+      $key = "$mid#$($r.chunkIdx)"
+      $map[$key] = $r; $mid4key[$key] = $mid
     }
+  }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($r in $map.Values) {
+    if (-not $r.emb) { continue }                              # emb = base64 Float16 embedding field
+    $emb = [CorpF16]::Decode([string]$r.emb)
+    if (-not $emb -or $emb.Count -eq 0) { continue }
+    $section = if ($r.subject) { $r.subject } elseif ($r.slideTitle) { $r.slideTitle } elseif ($r.label) { $r.label } elseif ($r.from) { $r.from } else { [string]$r.kind }
+    [void]$out.Add([pscustomobject]@{ section = [string]$section; text = [string]$r.body; embedding = $emb })
   }
   return $out
 }
@@ -343,6 +374,10 @@ function Corp-Search($question) {
   $scored = foreach ($seg in $script:Segments) {
     if ($seg.embedding.Count -ne $q.Count) { continue }
     [pscustomobject]@{ score = (Cosine $q $seg.embedding); c = $seg }
+  }
+  $scored = @($scored)
+  if ($script:Segments.Count -and -not $scored.Count) {
+    Log "WARNING: query dim=$($q.Count) != segment dim=$(@($script:Segments[0].embedding).Count) (align corp.dimensions / embed_model)"
   }
   return @($scored | Sort-Object score -Descending | Select-Object -First $TopK | ForEach-Object { $_.c })
 }
@@ -418,7 +453,9 @@ if (Corp-Enabled) {
   try {
     $script:Segments = Corp-LoadSegments
     $script:Mode = 'corp'
-    Log "corp search ON: $($script:Segments.Count) segments (base=$($script:CS.base) embed=$($script:CS.embed_deploy) chat=$($script:CS.chat_deploy))"
+    $segDim = if ($script:Segments.Count) { @($script:Segments[0].embedding).Count } else { 0 }
+    Log "corp search ON: $($script:Segments.Count) records dim=$segDim (base=$($script:CS.base) embed=$($script:CS.embed_deploy) chat=$($script:CS.chat_deploy))"
+    if ($script:Segments.Count -eq 0) { Log "WARNING: 0 records loaded - check seg_url points at the Tadori folder (<site>/Shared Documents/Tadori)" }
   } catch {
     Log "corp segments load failed ($($_.Exception.Message)) -> falling back to local Ollama"
   }

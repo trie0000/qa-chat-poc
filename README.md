@@ -132,8 +132,8 @@ start.bat をダブルクリック
 **Tadori が事前ベクトル化して SPO に置いた文書（セグメント）**を知識源にできます。
 
 - **設定は broker 側の `config.json` の `"corp"` セクション**に置く（ブラウザUIには一切持たせない。UIはリストへ質問を出し回答を読むだけ）：
-  - `seg_url`（ベクトル化済み文書=セグメントの SPO URL）／`base_url`（社内API ゲートウェイ or リレー loopback）／
-    `deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`／`proxy_url`（任意）
+  - `seg_url`＝**Tadori のセグメントフォルダ**（既定 `<site>/Shared Documents/Tadori`。`manifest.json` と `seg-NNNNN.json` が置かれている所。フルURLでもサーバ相対でも可。`site_url` と同じサイト前提）／
+    `base_url`（社内API ゲートウェイ）／`deploy_prefix`／`embed_model`／`dimensions`／`embed_api_version`／`chat_model`／`api_key`／`proxy_url`（任意）
   - Azure デプロイ名は `deploy_prefix + model名（ドット除去）` で導出（例: `dev-` + `gpt-4.1-mini` → `dev-gpt-41-mini`）。
   - リクエストは `base_url + /openai/deployments/<deploy>/embeddings?api-version=…`（Tadori リレーが受ける形式と同一）。
 
@@ -150,7 +150,7 @@ broker にはどれも当てはまらない（＝リレーの1ホップは不要
 
 > `api-key` ヘッダは broker が付与。社内CAの自己署名証明書でTLS検証に失敗する環境だけ別途対応が要る（現状未実装。必要なら追加する）。
 - **broker.ps1** はこの `corp` を読み、`base_url`/`api_key`/`seg_url` が揃っていれば **社内API検索モード**に切り替わる（空ならローカル Ollama にフォールバック）：
-  1. SPO セグメントをブラウザセッション（CDP）で読み込み、`embedding`（base64-float16）をデコード
+  1. SPO の `manifest.json`（`sealed[]`＋`open`）→ 各 `seg-NNNNN.json` の `records[]` をブラウザセッション（CDP, `GetFileByServerRelativeUrl/$value`）で読み、`emb`（base64-float16）をデコード。追記式の upsert/delete は messageId 単位 last-writer-wins で解決
   2. 質問を **社内API `…/openai/deployments/<embed>/embeddings`** で埋め込み
   3. L2 正規化 cosine で Top-K
   4. **社内API `…/openai/deployments/<chat>/chat/completions`** で回答生成
