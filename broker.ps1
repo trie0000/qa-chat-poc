@@ -224,7 +224,13 @@ $FieldsXml = @(
   @('Status',      "<Field Type='Choice' DisplayName='Status' Name='Status' StaticName='Status'><CHOICES><CHOICE>Pending</CHOICE><CHOICE>Detected</CHOICE><CHOICE>Answering</CHOICE><CHOICE>Answered</CHOICE><CHOICE>Error</CHOICE></CHOICES></Field>"),
   @('DetectedAt',  "<Field Type='DateTime' DisplayName='DetectedAt' Name='DetectedAt' StaticName='DetectedAt' Format='DateTime'/>"),
   @('AnsweredAt',  "<Field Type='DateTime' DisplayName='AnsweredAt' Name='AnsweredAt' StaticName='AnsweredAt' Format='DateTime'/>"),
-  @('DisplayedAt', "<Field Type='DateTime' DisplayName='DisplayedAt' Name='DisplayedAt' StaticName='DisplayedAt' Format='DateTime'/>")
+  @('DisplayedAt', "<Field Type='DateTime' DisplayName='DisplayedAt' Name='DisplayedAt' StaticName='DisplayedAt' Format='DateTime'/>"),
+  # UI -> broker inputs: chosen chat model and source-kind scope for this question.
+  @('Model',       "<Field Type='Text' DisplayName='Model' Name='Model' StaticName='Model'/>"),
+  @('Scope',       "<Field Type='Text' DisplayName='Scope' Name='Scope' StaticName='Scope'/>"),
+  # broker -> UI outputs: retrieved source cards (JSON) and answer metadata (model/tokens/cost JSON).
+  @('Sources',     "<Field Type='Note' DisplayName='Sources' Name='Sources' StaticName='Sources' NumLines='6' RichText='FALSE'/>"),
+  @('Meta',        "<Field Type='Note' DisplayName='Meta' Name='Meta' StaticName='Meta' NumLines='6' RichText='FALSE'/>")
 )
 function Ensure-Setup {
   if (-not (SpReq "$ByList`?`$select=Title").ok) {
@@ -263,7 +269,12 @@ function Inject-UI {
   $src = Eval-Value ("(async()=>{const r=await fetch(encodeURI($($UiUrl | ConvertTo-Json))+'?_='+Date.now()," +
                      "{cache:'no-cache',credentials:'include'});if(!r.ok)throw new Error('ui '+r.status);return await r.text();})()") $true
   Log "UI code fetched: $($src.Length) chars"
-  $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site } | ConvertTo-Json -Compress
+  # advertise the pickable chat models and the source-kind scopes present (raw kinds; the UI
+  # maps them to Japanese labels, since this file is ASCII-only). Requires records loaded first.
+  $models = @(Get-ChatModels)
+  $defModel = if ($script:Mode -eq 'corp') { [string]$Corp.chat_model } else { [string]$ChatModel }
+  $kinds = @($script:Records | ForEach-Object { [string]$_.kind } | Where-Object { $_ } | Select-Object -Unique)
+  $qa = @{ listTitle = $ListTitle; sessionId = $SessionId; pollIntervalMs = $PollMs; webUrl = $Site; mode = $script:Mode; models = $models; defaultModel = $defModel; scopes = $kinds } | ConvertTo-Json -Compress -Depth 5
   Eval-Value ("window.__QA_CONFIG__=$qa;true") $false | Out-Null
   Eval-Value $src $false | Out-Null
   # Re-inject on every new document: SP redirects/SPA navigations after auth would
@@ -289,8 +300,10 @@ function Ollama-Embed($text) {
   $prompt = if ($EmbedModel -like 'nomic*') { "search_query: $text" } else { $text }
   return (Ollama-Post '/api/embeddings' @{ model = $EmbedModel; prompt = $prompt }).embedding
 }
-function Ollama-Chat($messages) {
-  return (Ollama-Post '/api/chat' @{ model = $ChatModel; messages = $messages; stream = $false }).message.content
+function Ollama-Chat($messages, $model) {
+  $m = if ($model) { $model } else { $ChatModel }
+  $resp = Ollama-Post '/api/chat' @{ model = $m; messages = $messages; stream = $false }
+  return [pscustomobject]@{ content = [string]$resp.message.content; model = $m; prompt = [int]$resp.prompt_eval_count; completion = [int]$resp.eval_count }
 }
 
 # ---- local RAG (manual index) ----
@@ -349,10 +362,14 @@ function Corp-Embed($text) {
   if ($s.dimensions) { $body.dimensions = $s.dimensions }
   return (Corp-Http $url $body).data[0].embedding
 }
-function Corp-Chat($messages) {
+function Corp-Chat($messages, $model) {
   $s = $script:CS
-  $url = "$($s.base)/openai/deployments/$($s.chat_deploy)/chat/completions?api-version=$($s.chat_api_version)"
-  return (Corp-Http $url @{ messages = $messages }).choices[0].message.content
+  $mname  = if ($model) { [string]$model } else { [string]$Corp.chat_model }
+  $deploy = if ($model) { Corp-Deploy $mname } else { $s.chat_deploy }
+  $av     = if ($Reasoning -contains $mname) { '2024-12-01-preview' } else { '2024-06-01' }
+  $url = "$($s.base)/openai/deployments/$deploy/chat/completions?api-version=$av"
+  $resp = Corp-Http $url @{ messages = $messages }
+  return [pscustomobject]@{ content = [string]$resp.choices[0].message.content; model = $mname; prompt = [int]$resp.usage.prompt_tokens; completion = [int]$resp.usage.completion_tokens }
 }
 # Read a JSON file from SPO like tadori's SharePointClient.readFileText:
 #   {web}/_api/web/GetFileByServerRelativeUrl('<encodeURIComponent(path)>')/$value
@@ -522,12 +539,14 @@ function Rag-Walk($sorted, $must, $applyMust) {
       if (-not $ok) { continue }
     }
     if ($r.kind -eq 'onenote' -and $r.conv) { if ($seenConv[$r.conv]) { continue }; $seenConv[$r.conv] = $true }
+    Add-Member -InputObject $r -NotePropertyName score -NotePropertyValue ([double]$e.s) -Force   # carry score for the UI source cards
     [void]$out.Add($r); if ($out.Count -ge $TopK) { break }
   }
   return @($out)
 }
-function Rag-Retrieve($question) {
+function Rag-Retrieve($question, $scope) {
   if (-not $script:Records.Count) { return @() }
+  $scopeK = [string]$scope                                                 # '' or 'all' = every source kind
   $extra = Expand-Query $question
   $vecQ = ((([string]$question) + ' ' + ($extra -join ' ')).Trim())
   if ($extra.Count) { Log ("query expanded +[" + ($extra -join ', ') + "]") }
@@ -537,13 +556,14 @@ function Rag-Retrieve($question) {
   $useKw = ($w -gt 0 -and $qbi.Count -gt 0)
   $scored = New-Object System.Collections.ArrayList
   foreach ($r in $script:Records) {
+    if ($scopeK -and $scopeK -ne 'all' -and ([string]$r.kind) -ne $scopeK) { continue }   # source-scope filter
     if ($r.embedding.Count -ne $qvec.Count) { continue }
     $vcos = [Math]::Max(0.0, (Cosine $qvec $r.embedding))
     $s = if ($useKw) { (1 - $w) * $vcos + $w * ([Rag]::Coverage($qbi, $r.kwbi)) } else { $vcos }
     [void]$scored.Add([pscustomobject]@{ r = $r; s = $s })
   }
   if (-not $scored.Count) {
-    Log "WARNING: query dim=$($qvec.Count) != record dim=$(@($script:Records[0].embedding).Count) (align corp.dimensions / embed_model)"
+    Log "WARNING: 0 candidates (query dim=$($qvec.Count), scope=$(if ($scopeK) { $scopeK } else { 'all' })) - check dim/embed_model or scope"
     return @()
   }
   $sorted = @($scored | Sort-Object s -Descending)
@@ -554,16 +574,44 @@ function Rag-Retrieve($question) {
 }
 
 # ---- answer a Detected item ----
-function Build-Messages($curTurn, $question) {
-  $chunks = @(Rag-Retrieve $question)   # @() : PS unwraps a single-hit return to a scalar otherwise
-  if ($chunks.Count) { Log ("retrieved: " + (($chunks | ForEach-Object { $_.section }) -join ', ')) }
+# AI cost estimate (tadori usage/pricing parity): yen/token from a "QA per 10,000 yen" table
+# (1 QA ~= 1500 tokens = 1200 in + 300 out; yen/token = (10000 / QA_per_10000) / 1500).
+$QaPer10000 = @{ 'gpt-4o' = 7800; 'gpt-4o-mini' = 130000; 'gpt-4.1' = 10000; 'gpt-4.1-mini' = 54000; 'gpt-4.1-nano' = 217000; 'o3' = 10000; 'o4-mini' = 19000; 'gpt-5' = 14000; 'gpt-5-mini' = 71000; 'gpt-5-nano' = 350000 }
+function YenPerToken($model) {
+  $m = ([string]$model).ToLower(); $best = ''
+  foreach ($k in ($QaPer10000.Keys | Sort-Object { $_.Length } -Descending)) { if ($m.Contains($k)) { $best = $k; break } }
+  $qa = if ($best) { $QaPer10000[$best] } else { 10000 }
+  return (10000.0 / $qa) / 1500.0
+}
+# Chat models the UI may pick from (config-driven; falls back to the single configured model).
+function Get-ChatModels {
+  if ($script:Mode -eq 'corp') { if ($Corp.chat_models) { return @($Corp.chat_models | ForEach-Object { [string]$_ }) }; return @([string]$Corp.chat_model) }
+  if ($cfg.chat_models) { return @($cfg.chat_models | ForEach-Object { [string]$_ }) }
+  return @([string]$ChatModel)
+}
+function Resolve-Model($requested) { $r = [string]$requested; if ($r -and (@(Get-ChatModels) -contains $r)) { return $r }; return '' }
+# Serialize retrieved chunks into the Sources column (JSON array the UI renders as cards).
+function Build-SourcesJson($chunks) {
+  if (-not $chunks.Count) { return '[]' }
+  $n = 0
+  $arr = @($chunks | ForEach-Object {
+    $n++; $body = [string]$_.text
+    [pscustomobject]@{ n = $n; title = [string]$_.section; snippet = $(if ($body.Length -gt 240) { $body.Substring(0, 240) } else { $body }); body = $body; score = [math]::Round([double]$_.score, 3); kind = [string]$_.kind }
+  })
+  $j = $arr | ConvertTo-Json -Compress -Depth 5
+  if ($arr.Count -eq 1) { $j = '[' + $j + ']' }   # PS unwraps a 1-element array
+  return $j
+}
+function Build-Messages($curTurn, $question, $chunks) {
   $system = $cfg.system_prompt
   if ($chunks.Count) {
     $ctx = ($chunks | ForEach-Object { "[$($_.section)]`n$($_.text)" }) -join "`n`n"
     $system = $system + $cfg.grounding_prompt + $ctx
   }
   $messages = @( @{ role = 'system'; content = $system } )
-  $hq = "$ByList/items?`$select=Turn,Question,Answer&`$filter=SessionId eq '$SessionId' and Status eq 'Answered'&`$orderby=Turn asc&`$top=200"
+  # History keys off AnsweredAt (not Status) so a Power Automate flow that clobbers
+  # Status Answered->Detected cannot erase prior turns from the conversation context.
+  $hq = "$ByList/items?`$select=Turn,Question,Answer,AnsweredAt&`$filter=SessionId eq '$SessionId' and AnsweredAt ne null&`$orderby=Turn asc&`$top=200"
   $rows = @((SpReq $hq).json.value | Where-Object { [int]$_.Turn -lt [int]$curTurn })
   if ($rows.Count -gt $HistMax) { $rows = $rows[($rows.Count - $HistMax)..($rows.Count - 1)] }
   foreach ($r in $rows) {
@@ -587,10 +635,17 @@ function Handle-Detected($it) {
   $script:Picked[$id] = UtcNow
   Log "picked item $id (turn $($it.Turn))"
   try {
-    $messages = Build-Messages $it.Turn ([string]$it.Question)
-    $answer = if ($script:Mode -eq 'corp') { Corp-Chat $messages } else { Ollama-Chat $messages }
-    Sp-Write "$ByList/items($id)" @{ Answer = $answer; Status = 'Answered'; AnsweredAt = (UtcNow) } @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = '*' } | Out-Null
-    Log "answered item $id ($($answer.Length) chars)"
+    $model = Resolve-Model ([string]$it.Model)                    # '' when not chosen / not allowed -> broker default
+    $scope = [string]$it.Scope
+    $chunks = @(Rag-Retrieve ([string]$it.Question) $scope)       # @() : PS unwraps a single-hit return to a scalar
+    if ($chunks.Count) { Log ("retrieved $($chunks.Count) sources (scope=$(if ($scope) { $scope } else { 'all' }))") }
+    $messages = Build-Messages $it.Turn ([string]$it.Question) $chunks
+    $res = if ($script:Mode -eq 'corp') { Corp-Chat $messages $model } else { Ollama-Chat $messages $model }
+    $answer = [string]$res.content
+    $costYen = if ($script:Mode -eq 'corp') { ([int]$res.prompt + [int]$res.completion) * (YenPerToken $res.model) } else { 0.0 }
+    $meta = @{ model = [string]$res.model; mode = $script:Mode; promptTokens = [int]$res.prompt; completionTokens = [int]$res.completion; costYen = [double]$costYen } | ConvertTo-Json -Compress
+    Sp-Write "$ByList/items($id)" @{ Answer = $answer; Status = 'Answered'; AnsweredAt = (UtcNow); Sources = (Build-SourcesJson $chunks); Meta = $meta } @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = '*' } | Out-Null
+    Log "answered item $id ($($answer.Length) chars, $($chunks.Count) src, model=$($res.model))"
   } catch {
     $msg = $_.Exception.Message; if ($msg.Length -gt 1900) { $msg = $msg.Substring(0, 1900) }
     try { Sp-Write "$ByList/items($id)" @{ Answer = "[error] $msg"; Status = 'Error' } @{ 'X-HTTP-Method' = 'MERGE'; 'If-Match' = '*' } | Out-Null } catch {}
@@ -621,8 +676,7 @@ $script:Cdp = Connect-Cdp
 Log 'CDP connected'
 Wait-Auth
 Ensure-Setup
-Inject-UI
-# Retrieval backend: corp API (if config.json "corp" is filled in) else local Ollama index.
+# Retrieval backend loads BEFORE Inject-UI so the UI can advertise available models + source scopes.
 if (Corp-Enabled) {
   $script:CS = Corp-Settings
   try {
@@ -645,11 +699,12 @@ if ($script:Mode -ne 'corp') {
   } else { Log 'no knowledge index (plain chat)' }
 }
 Load-Glossary
+Inject-UI
 Log "hybrid RAG: keyword_weight=$RagKwWeight (0=pure vector)"
 Log "monitoring list '$ListTitle' every $($PollMs)ms (pickup=$Pickup, filter: $StatusFilter)"
 while ($true) {
   try {
-    $q = "$ByList/items?`$select=Id,Turn,Question,Status&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
+    $q = "$ByList/items?`$select=Id,Turn,Question,Status,Model,Scope&`$filter=SessionId eq '$SessionId' and $StatusFilter&`$orderby=Turn asc&`$top=50"
     $items = @((SpReq $q 'GET' $null $null 'minimalmetadata').json.value)
     foreach ($it in $items) {
       if (-not $script:Picked.ContainsKey([int]$it.Id)) {
