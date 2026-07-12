@@ -297,9 +297,13 @@ function Corp-Settings {
 function Corp-Http($url, $bodyObj) {
   $json = $bodyObj | ConvertTo-Json -Depth 20 -Compress
   $p = @{ Uri = $url; Method = 'Post'; Headers = @{ 'api-key' = $script:CS.api_key }
-          ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes($json); TimeoutSec = 300 }
+          ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes($json)
+          TimeoutSec = 300; UseBasicParsing = $true }
   if ($script:CS.proxy) { $p.Proxy = $script:CS.proxy; $p.ProxyUseDefaultCredentials = $true }
-  return Invoke-RestMethod @p
+  # PS 5.1 Invoke-RestMethod decodes bodies as ISO-8859-1 when the response
+  # Content-Type omits charset, mangling UTF-8 (Japanese). Decode raw bytes as UTF-8.
+  $resp = Invoke-WebRequest @p
+  return [Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray()) | ConvertFrom-Json
 }
 function Corp-Embed($text) {
   $s = $script:CS
