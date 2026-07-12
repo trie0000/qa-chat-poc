@@ -424,9 +424,11 @@
 
   function renderSidebar() {
     ensureCur();
-    var shown = sessOrder.filter(function (sid) { return sessMap[sid] && matchesSearch(sessMap[sid]); });
+    // only conversations that actually have a message belong in the history -- the current empty
+    // session (fresh load or just after "新しい会話") is the live view, not a history entry.
+    var shown = sessOrder.filter(function (sid) { return sessMap[sid] && sessMap[sid].turns.length > 0 && matchesSearch(sessMap[sid]); });
     if (!shown.length) {
-      sideList.innerHTML = '<div class="qa-sess-empty">' + (searchQ ? '一致する会話がありません' : '会話がありません') + '</div>';
+      sideList.innerHTML = '<div class="qa-sess-empty">' + (searchQ ? '一致する会話がありません' : 'まだ会話がありません') + '</div>';
       return;
     }
     sideList.innerHTML = shown.map(function (sid) {
